@@ -1,8 +1,15 @@
 # Telegram Video Panel в Docker.
-#   cp example.env .env      # впишите TVP_PASSWORD
+#   cp example.env .env      # ОБЯЗАТЕЛЬНО впишите TVP_PASSWORD
 #   docker compose up -d --build
 # Панель: http://IP-сервера:8765 (порт и адрес — TVP_PORT / TVP_BIND в .env)
 # Данные (вход в Telegram, ключи, задания) — ./data, видео — ./videos
+#
+# Домен с HTTPS (встроенный Caddy, сертификат Let's Encrypt автоматически) — в .env:
+#   TVP_DOMAIN=video.example.com
+#   COMPOSE_PROFILES=https
+#   TVP_BIND=127.0.0.1
+#   TVP_FORWARDED_ALLOW_IPS=*
+# Порты 80 и 443 сервера должны быть свободны, A-запись домена — указывать на сервер.
 
 services:
   tg-video-panel:
@@ -26,3 +33,31 @@ services:
       - ./videos:/videos
     # время на сохранение заданий при остановке — после запуска они продолжатся
     stop_grace_period: 30s
+
+  # HTTPS для домена: включается COMPOSE_PROFILES=https и TVP_DOMAIN в .env
+  caddy:
+    image: caddy:2-alpine
+    container_name: tg-video-panel-caddy
+    profiles: ["https"]
+    restart: unless-stopped
+    depends_on:
+      - tg-video-panel
+    environment:
+      TVP_DOMAIN: ${TVP_DOMAIN:-}
+    command:
+      - sh
+      - -c
+      - |
+        [ -n "$$TVP_DOMAIN" ] || { echo "Задайте TVP_DOMAIN в .env (например, TVP_DOMAIN=video.example.com)"; exit 1; }
+        exec caddy reverse-proxy --from "$$TVP_DOMAIN" --to tg-video-panel:8765
+    ports:
+      - "${TVP_HTTP_PORT:-80}:80"
+      - "${TVP_HTTPS_PORT:-443}:443"
+      - "${TVP_HTTPS_PORT:-443}:443/udp"
+    volumes:
+      - caddy_data:/data       # сертификаты — сохраняются между перезапусками
+      - caddy_config:/config
+
+volumes:
+  caddy_data:
+  caddy_config:

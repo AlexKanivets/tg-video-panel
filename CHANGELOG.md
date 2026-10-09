@@ -4,6 +4,15 @@
 — исправления повышают последнюю цифру, новые возможности — среднюю, несовместимые изменения — первую.
 Текущая версия видна в шапке панели и в выводе установщика.
 
+## [1.2.0] — 2026-10-10
+
+### Добавлено
+- **Домен и HTTPS для Docker Compose**: встроенный Caddy (профиль `https`) — включается строками
+  `TVP_DOMAIN` и `COMPOSE_PROFILES=https` в `.env`, сертификат Let's Encrypt выпускается и продлевается сам,
+  `http://` перенаправляется на `https://`; порты Caddy настраиваются (`TVP_HTTP_PORT`, `TVP_HTTPS_PORT`).
+- README: раздел «Домен и HTTPS для Docker Compose» — встроенный Caddy, Caddy на сервере, nginx + certbot.
+- README и `example.env`: обязательный пароль в `.env` для Docker Compose.
+
 ## [1.1.0] — 2026-10-09
 
 ### Добавлено
@@ -47,5 +56,6 @@
 - Установщик для Ubuntu 22.04/24.04: режимы по IP, с доменом (HTTPS через Caddy, без перезаписи чужого
   Caddyfile) и через SSH-туннель.
 
+[1.2.0]: https://github.com/AlexKanivets/tg-video-panel/releases/tag/v1.2.0
 [1.1.0]: https://github.com/AlexKanivets/tg-video-panel/releases/tag/v1.1.0
 [1.0.0]: https://github.com/AlexKanivets/tg-video-panel/releases/tag/v1.0.0

@@ -52,7 +52,7 @@ sudo bash install.sh --ip
 | Команда | Адрес панели | Когда подходит |
 |---|---|---|
 | `sudo bash install.sh --ip` | `http://IP-сервера:8765` | Быстрый старт. Соединение **без шифрования** |
-| `sudo bash install.sh video.example.com` | `https://video.example.com` | Рекомендуется. Нужен домен, A-запись которого указывает на сервер. HTTPS-сертификат выпускается автоматически (Caddy) |
+| `sudo bash install.sh video.example.com` | `https://video.example.com` | Рекомендуется. Нужен домен, A-запись которого указывает на сервер. HTTPS-сертификат выпускается автоматически (Caddy). Для Docker — см. [Домен и HTTPS для Docker Compose](#домен-и-https-для-docker-compose) |
 | `sudo bash install.sh` | `http://127.0.0.1:8765` через SSH-туннель | Панель вообще не видна из интернета |
 
 Для режима с доменом установщик ставит Caddy из репозитория Ubuntu. Если Caddy у вас уже настроен для других сайтов,
@@ -95,6 +95,72 @@ sudo docker compose up -d --build
 не от root, ffmpeg уже установлен. Логи — `sudo docker compose logs -f`, остановка — `sudo docker compose down`.
 
 > Не ставьте оба способа одновременно на одном сервере — они займут один порт.
+
+### Домен и HTTPS для Docker Compose
+
+Чтобы панель открывалась по `https://video.example.com`, сначала в DNS вашего домена создайте **A-запись**,
+указывающую на IP сервера, и откройте в фаерволе порты **80 и 443**. Дальше — один из трёх вариантов.
+
+**Вариант А. Встроенный Caddy** — проще всего, если на сервере порты 80/443 свободны (нет другого веб-сервера).
+Допишите в `.env`:
+
+```bash
+TVP_DOMAIN=video.example.com
+COMPOSE_PROFILES=https
+TVP_BIND=127.0.0.1
+TVP_FORWARDED_ALLOW_IPS=*
+```
+
+и выполните `sudo docker compose up -d`. Запустится второй контейнер — Caddy: он сам получит сертификат
+Let's Encrypt, будет продлевать его и перенаправлять `http://` на `https://`. Сертификаты хранятся в томе Docker
+и переживают перезапуски. Если сертификат не выпускается — смотрите `sudo docker compose logs caddy`
+(чаще всего A-запись ещё не обновилась или закрыт порт 80).
+
+**Вариант Б. Caddy уже установлен на сервере** (обслуживает другие сайты). В `.env` панели:
+`TVP_BIND=127.0.0.1` и `TVP_FORWARDED_ALLOW_IPS=*`, затем `sudo docker compose up -d`.
+Допишите в конец `/etc/caddy/Caddyfile`:
+
+```
+video.example.com {
+    reverse_proxy 127.0.0.1:8765
+}
+```
+
+и выполните `sudo systemctl reload caddy` — сертификат Caddy выпустит сам.
+
+**Вариант В. nginx.** В `.env` панели — те же две строки, что в варианте Б. Создайте
+`/etc/nginx/sites-available/tg-video-panel`:
+
+```nginx
+server {
+    listen 80;
+    server_name video.example.com;
+
+    client_max_body_size 0;
+    location / {
+        proxy_pass http://127.0.0.1:8765;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;          # ZIP-архивы и видео отдаются потоком
+        proxy_read_timeout 3600s;     # большие ZIP скачиваются долго
+    }
+}
+```
+
+затем включите сайт и получите сертификат:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/tg-video-panel /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+sudo apt-get install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d video.example.com
+```
+
+Во всех вариантах `TVP_BIND=127.0.0.1` закрывает прямой доступ `http://IP:8765` — панель открывается только
+по HTTPS, и пароль с кодом Telegram больше не передаются открытым текстом. `TVP_FORWARDED_ALLOW_IPS=*`
+нужен, чтобы панель видела, что открыта по HTTPS (в Docker прокси приходит не с адреса 127.0.0.1);
+это безопасно, пока порт панели закрыт снаружи через `TVP_BIND=127.0.0.1`.
 
 ## Первый запуск
 
@@ -158,7 +224,7 @@ sudo docker compose up -d --build      # Docker Compose
 ```bash
 cd ~/tg-video-panel
 git fetch --tags
-sudo git checkout v1.1.0
+sudo git checkout v1.2.0
 sudo bash install.sh --ip
 ```
 
@@ -195,7 +261,8 @@ sudo journalctl -u tg-video-panel -f      # логи
   к вашему аккаунту Telegram и к Яндекс Диску. В репозиторий они не попадают (см. `.gitignore`), образец
   настроек без секретов — `example.env`.
 - По возможности ставьте панель с доменом (HTTPS): в режиме `--ip` пароль панели и код Telegram передаются
-  без шифрования.
+  без шифрования. Как подключить домен — для установщика см. «Режимы установки», для Docker —
+  «Домен и HTTPS для Docker Compose».
 - Ссылки на Яндекс Диск публичные — их может открыть любой, у кого есть ссылка.
 
 ## Удаление
