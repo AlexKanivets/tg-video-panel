@@ -11,6 +11,8 @@ tg_session*
 *.env
 .env
 .env.*
+# образец настроек без секретов — публикуется
+!example.env
 # история заданий (названия групп и папок)
 jobs.json
 panel.log
@@ -18,6 +20,7 @@ panel.log
 
 # ===== Скачанные видео и служебные файлы папок =====
 videos/
+data/
 telegram_videos/
 .tvp_*
 *.part

@@ -16,7 +16,7 @@ Telegram Video Panel — панель для пакетного скачиван
 
 # Версия панели (семантическая: исправления → 1.0.1, новые возможности → 1.1.0, несовместимые изменения → 2.0.0).
 # Меняется при каждом изменении кода; что изменилось — в CHANGELOG.md.
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 import asyncio
 import hashlib
@@ -3059,4 +3059,4 @@ if __name__ == "__main__":
         import threading
         threading.Timer(1.5, lambda: webbrowser.open(url)).start()
     uvicorn.run(app, host=HOST, port=PORT, log_level="info",
-                proxy_headers=True, forwarded_allow_ips="127.0.0.1")
+                proxy_headers=True, forwarded_allow_ips=os.environ.get("TVP_FORWARDED_ALLOW_IPS", "127.0.0.1"))

@@ -1,0 +1,28 @@
+# Telegram Video Panel в Docker.
+#   cp example.env .env      # впишите TVP_PASSWORD
+#   docker compose up -d --build
+# Панель: http://IP-сервера:8765 (порт и адрес — TVP_PORT / TVP_BIND в .env)
+# Данные (вход в Telegram, ключи, задания) — ./data, видео — ./videos
+
+services:
+  tg-video-panel:
+    build: .
+    image: tg-video-panel:local
+    container_name: tg-video-panel
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      TVP_PASSWORD: ${TVP_PASSWORD:?Задайте TVP_PASSWORD в файле .env (образец — example.env)}
+      TVP_SERVER: "1"
+      TVP_HOST: 0.0.0.0
+      TVP_PORT: "8765"
+      TVP_DATA_DIR: /data
+      TVP_DOWNLOAD_DIR: /videos
+    ports:
+      - "${TVP_BIND:-0.0.0.0}:${TVP_PORT:-8765}:8765"
+    volumes:
+      - ./data:/data
+      - ./videos:/videos
+    # время на сохранение заданий при остановке — после запуска они продолжатся
+    stop_grace_period: 30s

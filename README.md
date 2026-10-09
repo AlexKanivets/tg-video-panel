@@ -31,12 +31,17 @@
 
 ## Установка на сервер
 
+Два способа — выберите один: **установщик** (systemd, проще всего) или **Docker Compose**.
+Всё хранится в одной папке `/opt/tg-video-panel`.
+
+### Способ 1. Установщик
+
 Подключитесь к серверу по SSH и выполните:
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
-git clone https://github.com/AlexKanivets/tg-video-panel.git
-cd tg-video-panel
+sudo git clone https://github.com/AlexKanivets/tg-video-panel.git /opt/tg-video-panel
+cd /opt/tg-video-panel
 sudo bash install.sh --ip
 ```
 
@@ -58,6 +63,26 @@ sudo bash install.sh --ip
 ```bash
 ssh -N -L 8765:127.0.0.1:8765 root@IP-сервера
 ```
+
+### Способ 2. Docker Compose
+
+Нужны Docker и плагин Compose ([установка Docker](https://docs.docker.com/engine/install/ubuntu/)).
+
+```bash
+sudo git clone https://github.com/AlexKanivets/tg-video-panel.git /opt/tg-video-panel
+cd /opt/tg-video-panel
+sudo cp example.env .env
+sudo nano .env                      # впишите TVP_PASSWORD (например, из: openssl rand -base64 18)
+sudo docker compose up -d --build
+```
+
+Панель — `http://IP-сервера:8765`. Порт и адрес задаются в `.env`: `TVP_PORT`, `TVP_BIND`
+(`127.0.0.1` — если панель за вашим обратным прокси с HTTPS). Без пароля в `.env` Compose не запустится.
+
+Данные лежат рядом, в `./data` (вход в Telegram, ключи, задания) и `./videos`. Внутри контейнера панель работает
+не от root, ffmpeg уже установлен. Логи — `sudo docker compose logs -f`, остановка — `sudo docker compose down`.
+
+> Не ставьте оба способа одновременно на одном сервере — они займут один порт.
 
 ## Первый запуск
 
@@ -98,13 +123,18 @@ ssh -N -L 8765:127.0.0.1:8765 root@IP-сервера
 ## Обновление
 
 ```bash
-cd ~/tg-video-panel
-git pull
-sudo bash install.sh --ip      # тот же режим, что при установке
+cd /opt/tg-video-panel
+sudo git pull
+sudo bash install.sh --ip              # установщик: тот же режим, что при установке
+# или
+sudo docker compose up -d --build      # Docker Compose
 ```
 
 Пароль, вход в Telegram, подключение Диска, задания и видео сохраняются. Незавершённые задания после
 перезапуска продолжатся сами.
+
+> **Обновление с 1.0.0:** данные раньше хранились в `/var/lib/tg-video-panel` и `/etc/tg-video-panel.env`.
+> Установщик 1.1.0 сам переносит их в `/opt/tg-video-panel` (видео не копируются, а перемещаются — это мгновенно).
 
 ## Версии
 
@@ -116,7 +146,7 @@ sudo bash install.sh --ip      # тот же режим, что при уста�
 ```bash
 cd ~/tg-video-panel
 git fetch --tags
-git checkout v1.0.0
+sudo git checkout v1.1.0
 sudo bash install.sh --ip
 ```
 
@@ -130,22 +160,28 @@ sudo systemctl restart tg-video-panel     # перезапуск
 sudo journalctl -u tg-video-panel -f      # логи
 ```
 
-Сменить пароль панели: `sudo nano /etc/tg-video-panel.env` (строка `TVP_PASSWORD=`), затем
-`sudo systemctl restart tg-video-panel`.
+Сменить пароль панели: `sudo nano /opt/tg-video-panel/.env` (строка `TVP_PASSWORD=`), затем
+`sudo systemctl restart tg-video-panel` (или `sudo docker compose up -d` для Docker).
+
+Все параметры с пояснениями — в [example.env](example.env).
 
 ## Где что хранится и безопасность
 
+Всё — в `/opt/tg-video-panel`:
+
 | Что | Где |
 |---|---|
-| Программа | `/opt/tg-video-panel` |
-| Пароль панели | `/etc/tg-video-panel.env` (доступ только root) |
-| Ключи Telegram API, токен Яндекс Диска, настройки | `/var/lib/tg-video-panel/config.json` |
-| Вход в Telegram | `/var/lib/tg-video-panel/tg_session.session` |
-| Видео | `/var/lib/tg-video-panel/videos/<папка>` |
+| Программа | `/opt/tg-video-panel` (`app.py`, `.venv`) |
+| Пароль панели и параметры | `/opt/tg-video-panel/.env` (доступ только root) |
+| Ключи Telegram API, токен Яндекс Диска, настройки | `/opt/tg-video-panel/data/config.json` |
+| Вход в Telegram | `/opt/tg-video-panel/data/tg_session.session` |
+| Очередь и история заданий | `/opt/tg-video-panel/data/jobs.json` |
+| Видео | `/opt/tg-video-panel/videos/<папка>` |
 
 - Панель работает от отдельного системного пользователя `tvp` без входа в систему; данные доступны только ему.
-- **Никому не передавайте `tg_session.session` и `config.json`** — это полный доступ к вашему аккаунту Telegram
-  и к Яндекс Диску. В репозиторий они не попадают (см. `.gitignore`).
+- **Никому не передавайте `.env`, `tg_session.session` и `config.json`** — это пароль панели и полный доступ
+  к вашему аккаунту Telegram и к Яндекс Диску. В репозиторий они не попадают (см. `.gitignore`), образец
+  настроек без секретов — `example.env`.
 - По возможности ставьте панель с доменом (HTTPS): в режиме `--ip` пароль панели и код Telegram передаются
   без шифрования.
 - Ссылки на Яндекс Диск публичные — их может открыть любой, у кого есть ссылка.
@@ -153,12 +189,11 @@ sudo journalctl -u tg-video-panel -f      # логи
 ## Удаление
 
 ```bash
-sudo systemctl disable --now tg-video-panel
-sudo rm -f /etc/systemd/system/tg-video-panel.service /etc/tg-video-panel.env
-sudo rm -rf /opt/tg-video-panel
-sudo rm -rf /var/lib/tg-video-panel      # ВНИМАНИЕ: удалит и скачанные видео, и вход в Telegram
-sudo userdel tvp
+sudo systemctl disable --now tg-video-panel        # Docker: cd /opt/tg-video-panel && sudo docker compose down --rmi all
+sudo rm -f /etc/systemd/system/tg-video-panel.service
 sudo systemctl daemon-reload
+sudo userdel tvp
+sudo rm -rf /opt/tg-video-panel     # ВНИМАНИЕ: удалит и скачанные видео, и вход в Telegram
 ```
 
 Если ставили с доменом — удалите блок `# tg-video-panel` из `/etc/caddy/Caddyfile` и выполните
@@ -188,7 +223,7 @@ sudo systemctl daemon-reload
 
 ## Как устроено
 
-Один файл `app.py`: [Starlette](https://www.starlette.io/) + [uvicorn](https://www.uvicorn.org/) +
+Один файл `app.py` (версия — константа `VERSION` в начале файла): [Starlette](https://www.starlette.io/) + [uvicorn](https://www.uvicorn.org/) +
 [Telethon](https://github.com/LonamiWebs/Telethon) (вход как пользователь Telegram, MTProto) +
 [httpx](https://www.python-httpx.org/) (REST API Яндекс Диска). Интерфейс встроен в `app.py`,
 без сборки и внешних CDN. `install.sh` ставит всё в venv и создаёт службу systemd.

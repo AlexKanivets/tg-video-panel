@@ -5,16 +5,20 @@
 #   sudo bash install.sh --ip              — по IP: http://<IP сервера>:8765 (вход по паролю панели)
 #   sudo bash install.sh video.example.com — с доменом: HTTPS через Caddy (сертификат автоматически)
 #
+# Всё хранится в /opt/tg-video-panel: программа, .env (пароль), data/ (вход в Telegram, ключи), videos/.
 # Повторный запуск обновляет код и сохраняет пароль, вход в Telegram и скачанные видео.
 set -euo pipefail
 
 DOMAIN="${1:-}"
-if [ "$DOMAIN" = "-h" ] || [ "$DOMAIN" = "--help" ]; then sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0; fi
+if [ "$DOMAIN" = "-h" ] || [ "$DOMAIN" = "--help" ]; then sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0; fi
 BIND=127.0.0.1
 if [ "$DOMAIN" = "--ip" ]; then BIND=0.0.0.0; DOMAIN=""; fi
 APP_DIR=/opt/tg-video-panel
-DATA_DIR=/var/lib/tg-video-panel
-ENV_FILE=/etc/tg-video-panel.env
+DATA_DIR=$APP_DIR/data
+VIDEO_DIR=$APP_DIR/videos
+ENV_FILE=$APP_DIR/.env
+OLD_DATA=/var/lib/tg-video-panel     # расположение до версии 1.1.0
+OLD_ENV=/etc/tg-video-panel.env
 SVC=tg-video-panel
 PORT=8765
 SRC="$(cd "$(dirname "$0")" && pwd)"
@@ -30,10 +34,37 @@ python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || { echo "Нуже
 
 echo "==> Пользователь и папки"
 id tvp >/dev/null 2>&1 || useradd --system --home "$DATA_DIR" --shell /usr/sbin/nologin tvp
-mkdir -p "$APP_DIR" "$DATA_DIR/videos"
-install -m 644 "$SRC/app.py" "$SRC/requirements.txt" "$APP_DIR/"
-chown -R tvp:tvp "$DATA_DIR"
-chmod 750 "$DATA_DIR"
+if [ "$(getent passwd tvp | cut -d: -f6)" != "$DATA_DIR" ]; then
+  systemctl stop $SVC 2>/dev/null || true   # usermod не меняет папку, пока служба работает; ниже она перезапустится
+  usermod -d "$DATA_DIR" tvp 2>/dev/null || true
+fi
+mkdir -p "$APP_DIR" "$DATA_DIR" "$VIDEO_DIR"
+if [ "$SRC" != "$APP_DIR" ]; then
+  install -m 644 "$SRC/app.py" "$SRC/requirements.txt" "$APP_DIR/"
+  [ -f "$SRC/example.env" ] && install -m 644 "$SRC/example.env" "$APP_DIR/"
+fi
+
+# Перенос со старого расположения (/var/lib/tg-video-panel, /etc/tg-video-panel.env) — один раз
+if [ -d "$OLD_DATA" ] && [ ! -e "$DATA_DIR/config.json" ]; then
+  echo "==> Перенос данных из $OLD_DATA в $APP_DIR"
+  systemctl stop $SVC 2>/dev/null || true
+  shopt -s dotglob nullglob
+  for f in "$OLD_DATA"/config.json "$OLD_DATA"/tg_session* "$OLD_DATA"/.secret "$OLD_DATA"/jobs.json; do
+    [ -e "$f" ] || continue
+    mv "$f" "$DATA_DIR/"
+  done
+  if [ -d "$OLD_DATA/videos" ]; then
+    for x in "$OLD_DATA/videos"/*; do mv "$x" "$VIDEO_DIR/"; done
+  fi
+  shopt -u dotglob nullglob
+  if [ -f "$DATA_DIR/jobs.json" ]; then sed -i "s#$OLD_DATA/videos#$VIDEO_DIR#g" "$DATA_DIR/jobs.json"; fi
+  rmdir "$OLD_DATA/videos" "$OLD_DATA" 2>/dev/null || echo "   в $OLD_DATA что-то осталось — проверьте вручную"
+fi
+if [ -f "$OLD_ENV" ] && [ ! -f "$ENV_FILE" ]; then
+  mv "$OLD_ENV" "$ENV_FILE"
+fi
+chown -R tvp:tvp "$DATA_DIR" "$VIDEO_DIR"
+chmod 750 "$DATA_DIR" "$VIDEO_DIR"
 
 echo "==> Python-окружение"
 [ -x "$APP_DIR/.venv/bin/python" ] || python3 -m venv "$APP_DIR/.venv"
@@ -41,20 +72,22 @@ echo "==> Python-окружение"
 "$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
 "$APP_DIR/.venv/bin/pip" install -q cryptg 2>/dev/null || echo "   (cryptg не установился — скачивание будет чуть медленнее, это не критично)"
 
-echo "==> Настройки"
+echo "==> Настройки ($ENV_FILE)"
+set_kv() {  # задать KEY=value в .env (заменить строку или дописать)
+  if grep -q "^$1=" "$ENV_FILE"; then sed -i "s#^$1=.*#$1=$2#" "$ENV_FILE"; else echo "$1=$2" >> "$ENV_FILE"; fi
+}
 if [ ! -f "$ENV_FILE" ]; then
-  PASS="$(python3 -c 'import secrets; print(secrets.token_urlsafe(12))')"
-  cat > "$ENV_FILE" <<CFG
-TVP_SERVER=1
-TVP_HOST=$BIND
-TVP_PORT=$PORT
-TVP_PASSWORD=$PASS
-TVP_DATA_DIR=$DATA_DIR
-TVP_DOWNLOAD_DIR=$DATA_DIR/videos
-CFG
-  chmod 600 "$ENV_FILE"
+  if [ -f "$APP_DIR/example.env" ]; then cp "$APP_DIR/example.env" "$ENV_FILE"; else : > "$ENV_FILE"; fi
 fi
-sed -i "s/^TVP_HOST=.*/TVP_HOST=$BIND/" "$ENV_FILE"
+chmod 600 "$ENV_FILE"
+if ! grep -q "^TVP_PASSWORD=." "$ENV_FILE"; then
+  set_kv TVP_PASSWORD "$(python3 -c 'import secrets; print(secrets.token_urlsafe(12))')"
+fi
+set_kv TVP_SERVER 1
+set_kv TVP_HOST "$BIND"
+set_kv TVP_PORT "$PORT"
+set_kv TVP_DATA_DIR "$DATA_DIR"
+set_kv TVP_DOWNLOAD_DIR "$VIDEO_DIR"
 PASS="$(grep '^TVP_PASSWORD=' "$ENV_FILE" | cut -d= -f2-)"
 
 echo "==> Служба systemd"
@@ -72,11 +105,12 @@ EnvironmentFile=$ENV_FILE
 ExecStart=$APP_DIR/.venv/bin/python $APP_DIR/app.py
 Restart=always
 RestartSec=3
+TimeoutStopSec=30
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=$DATA_DIR
+ReadWritePaths=$DATA_DIR $VIDEO_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -130,10 +164,10 @@ fi
 sleep 2
 if systemctl is-active --quiet $SVC; then STATUS="работает"; else STATUS="НЕ запустилась — смотрите: journalctl -u $SVC -n 50"; fi
 IP="$(curl -s4 --max-time 3 https://ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')"
+VER="$(grep -m1 '^VERSION = ' "$APP_DIR/app.py" | cut -d'"' -f2)"
 
 echo
 echo "================================================================"
-VER="$(grep -m1 '^VERSION = ' "$APP_DIR/app.py" | cut -d'"' -f2)"
 echo " Telegram Video Panel v$VER: $STATUS"
 echo " Пароль панели:  $PASS"
 if [ -n "$DOMAIN" ]; then
@@ -147,7 +181,7 @@ else
   echo "   ssh -N -L $PORT:127.0.0.1:$PORT $(logname 2>/dev/null || echo root)@$IP"
   echo " затем откройте  http://127.0.0.1:$PORT"
 fi
-echo " Видео на сервере: $DATA_DIR/videos"
+echo " Папка панели:   $APP_DIR  (видео — $VIDEO_DIR)"
 echo " Управление: systemctl status|restart|stop $SVC ; логи: journalctl -u $SVC -f"
 echo " Сменить пароль: sudo nano $ENV_FILE && sudo systemctl restart $SVC"
 echo "================================================================"
