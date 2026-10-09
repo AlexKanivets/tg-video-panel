@@ -16,9 +16,12 @@ Telegram Video Panel — панель для пакетного скачиван
 
 # Версия панели (семантическая: исправления → 1.0.1, новые возможности → 1.1.0, несовместимые изменения → 2.0.0).
 # Меняется при каждом изменении кода; что изменилось — в CHANGELOG.md.
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 
 import asyncio
+import io
+import sqlite3
+import tempfile
 import hashlib
 import hmac
 import json
@@ -1540,6 +1543,120 @@ async def jobs_list(request: Request):
                "limits": {"dl_jobs": st["dl_jobs"], "tg_parallel": st["tg_parallel"], "ya_parallel": st["ya_parallel"]}})
 
 
+# ---------- резервная копия (зашифрованная) ----------
+#
+# Файл .tvpbak: b"TVPBAK1" + соль(16) + nonce(12) + AES-256-GCM(zip). Ключ — scrypt(пароль, соль, N=2^15, r=8, p=1).
+# Внутри zip: config.json (ключи Telegram API, Яндекс Диск, настройки), tg_session.session (вход в Telegram),
+# .secret и manifest.json. Видео и пароль панели не входят.
+
+BACKUP_MAGIC = b"TVPBAK1"
+
+
+def _backup_key(password: str, salt: bytes) -> bytes:
+    return hashlib.scrypt(password.encode("utf-8"), salt=salt, n=2 ** 15, r=8, p=1, maxmem=64 * 1024 * 1024, dklen=32)
+
+
+def _session_bytes() -> bytes:
+    """Согласованная копия sqlite-сессии Telethon (даже пока клиент подключён)."""
+    src = Path(SESSION + ".session")
+    if not src.exists():
+        return b""
+    with tempfile.TemporaryDirectory(dir=DATA_DIR) as td:
+        dst = Path(td) / "s.session"
+        with sqlite3.connect(str(src)) as a, sqlite3.connect(str(dst)) as b:
+            a.backup(b)
+        return dst.read_bytes()
+
+
+def make_backup(password: str) -> bytes:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("manifest.json", json.dumps({"app": "tg-video-panel", "version": VERSION,
+                                                "created": datetime.now(timezone.utc).isoformat()}))
+        if CONFIG_FILE.exists():
+            z.writestr("config.json", CONFIG_FILE.read_bytes())
+        sess = _session_bytes()
+        if sess:
+            z.writestr("tg_session.session", sess)
+        if SECRET_FILE.exists():
+            z.writestr(".secret", SECRET_FILE.read_bytes())
+    salt, nonce = secrets.token_bytes(16), secrets.token_bytes(12)
+    return BACKUP_MAGIC + salt + nonce + AESGCM(_backup_key(password, salt)).encrypt(nonce, buf.getvalue(), BACKUP_MAGIC)
+
+
+def open_backup(data: bytes, password: str) -> dict:
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    if not data.startswith(BACKUP_MAGIC) or len(data) < len(BACKUP_MAGIC) + 28 + 16:
+        raise HTTPException(400, "Это не файл резервной копии панели")
+    salt = data[7:23]
+    nonce = data[23:35]
+    try:
+        raw = AESGCM(_backup_key(password, salt)).decrypt(nonce, data[35:], BACKUP_MAGIC)
+    except InvalidTag:
+        raise HTTPException(400, "Неверный пароль резервной копии (или файл повреждён)")
+    with zipfile.ZipFile(io.BytesIO(raw)) as z:
+        out = {n: z.read(n) for n in z.namelist() if n in ("manifest.json", "config.json", "tg_session.session", ".secret")}
+    if "manifest.json" not in out:
+        raise HTTPException(400, "В файле нет данных панели")
+    return out
+
+
+async def backup_download(request: Request):
+    pwd = str((await body(request)).get("password") or "")
+    if len(pwd) < 8:
+        raise HTTPException(400, "Пароль копии — не короче 8 символов")
+    data = await asyncio.to_thread(make_backup, pwd)
+    name = f"tg-video-panel-backup-{datetime.now():%Y-%m-%d}.tvpbak"
+    return Response(data, media_type="application/octet-stream",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"', "Cache-Control": "no-store"})
+
+
+async def backup_restore(request: Request):
+    if any(j["status"] in ("queued", "running") for j in jobs.values()):
+        raise HTTPException(409, "Сначала дождитесь окончания заданий или остановите их")
+    form = await request.form()
+    up, pwd = form.get("file"), str(form.get("password") or "")
+    if up is None or not hasattr(up, "read"):
+        raise HTTPException(400, "Выберите файл резервной копии")
+    data = await up.read()
+    if len(data) > 50 * 1024 * 1024:
+        raise HTTPException(400, "Файл слишком большой для резервной копии панели")
+    parts = await asyncio.to_thread(open_backup, data, pwd)
+    if "config.json" in parts:
+        try:
+            json.loads(parts["config.json"])
+        except Exception:
+            raise HTTPException(400, "Повреждённые настройки в резервной копии")
+    await drop_client()  # отпускаем текущую сессию Telegram перед заменой
+    if "config.json" in parts:
+        CONFIG_FILE.write_bytes(parts["config.json"])
+        CONFIG_FILE.chmod(0o600)
+    if "tg_session.session" in parts:
+        Path(SESSION + ".session-journal").unlink(missing_ok=True)
+        Path(SESSION + ".session").write_bytes(parts["tg_session.session"])
+        Path(SESSION + ".session").chmod(0o600)
+    if ".secret" in parts:
+        SECRET_FILE.write_bytes(parts[".secret"])
+        SECRET_FILE.chmod(0o600)
+    m = json.loads(parts["manifest.json"])
+    st = {"authorized": False, "me": None}
+    try:
+        c = await get_client()
+        if c and await c.is_user_authorized():
+            me = await c.get_me()
+            st.update(authorized=True, me=" ".join(x for x in (me.first_name, me.last_name) if x) or me.username)
+    except Exception as e:
+        st["error"] = f"Telegram: {e}"
+    resp = ok(dict(st, version=m.get("version"), created=m.get("created"),
+                   yandex=bool((json.loads(parts.get("config.json") or b"{}").get("yandex") or {}).get("token"))))
+    if ".secret" in parts:  # подпись входа сменилась — сразу выдаём новую cookie, чтобы не выкинуло из панели
+        resp.set_cookie(COOKIE, auth_token(), max_age=60 * 60 * 24 * 30, httponly=True, samesite="strict",
+                        secure=request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https")
+    return resp
+
+
 async def update_get(request: Request):
     return ok(update_public())
 
@@ -2138,6 +2255,8 @@ routes = [
     Route("/api/cleanup/run", cleanup_now, methods=["POST"]),
     Route("/api/update", update_get),
     Route("/api/update/check", update_now, methods=["POST"]),
+    Route("/api/backup", backup_download, methods=["POST"]),
+    Route("/api/backup/restore", backup_restore, methods=["POST"]),
     Route("/api/restore", restore_start, methods=["POST"]),
     Route("/api/open_folder", open_folder, methods=["POST"]),
     Route("/api/files", files),
@@ -2366,6 +2485,15 @@ PAGE = r"""<!doctype html>
     </div>
     <div style="margin-top:14px"><button class="primary" id="keysBtn">Сохранить</button></div>
     <div class="err" id="keysErr"></div>
+    <details style="margin-top:12px"><summary class="muted" style="font-size:13px;cursor:pointer">Есть резервная копия с другого сервера? Восстановить</summary>
+      <p class="hint" style="margin:8px 0 0">Вернёт ключи Telegram, вход в Telegram, подключение Яндекс Диска и все настройки.</p>
+      <div class="row" style="margin-top:8px">
+        <div><label>Файл резервной копии (.tvpbak)</label><input type="file" id="rs1File" accept=".tvpbak"></div>
+        <div><label>Пароль копии</label><input type="password" id="rs1Pwd" autocomplete="off"></div>
+        <div class="fit"><button id="rs1Btn" type="button">Восстановить</button></div>
+      </div>
+      <div class="err" id="rs1Err"></div>
+    </details>
   </section>
 
   <section class="card hidden" id="loginCard">
@@ -2485,6 +2613,26 @@ PAGE = r"""<!doctype html>
       <div><label>Видео из Telegram одновременно (всего)</label><input type="number" id="stTg" min="1" max="8"></div>
       <div><label>Файлов на Яндекс Диск одновременно (всего)</label><input type="number" id="stYa" min="1" max="8"></div>
     </div>
+  </section>
+  <section class="card" id="backupCard">
+    <h2>Резервная копия</h2>
+    <p class="hint">Один зашифрованный файл: ключи Telegram API, вход в Telegram, подключение Яндекс Диска и все настройки панели.
+      Пригодится для переезда на другой сервер. Видео и пароль панели в копию не входят.</p>
+    <div class="row">
+      <div><label>Пароль для копии (не короче 8 символов)</label><input type="password" id="bkPwd" autocomplete="new-password"></div>
+      <div><label>Пароль ещё раз</label><input type="password" id="bkPwd2" autocomplete="new-password"></div>
+      <div class="fit"><button class="primary" id="bkBtn" type="button">Скачать копию</button></div>
+    </div>
+    <div class="muted" style="font-size:13px;margin-top:6px">⚠ Запомните пароль: без него копию не открыть никак. Храните файл надёжно — в нём вход в ваш Telegram.</div>
+    <div class="err" id="bkErr"></div>
+    <h3>Восстановить из копии</h3>
+    <p class="hint" style="margin:0">Заменит текущие ключи, вход в Telegram, подключение Диска и настройки на те, что в копии.</p>
+    <div class="row" style="margin-top:8px">
+        <div><label>Файл резервной копии (.tvpbak)</label><input type="file" id="rs2File" accept=".tvpbak"></div>
+        <div><label>Пароль копии</label><input type="password" id="rs2Pwd" autocomplete="off"></div>
+        <div class="fit"><button id="rs2Btn" type="button">Восстановить</button></div>
+      </div>
+      <div class="err" id="rs2Err"></div>
   </section>
   <section class="card" id="updCard">
     <h2>Обновления</h2>
@@ -3177,6 +3325,44 @@ $('#jobsList').addEventListener('toggle', e => {
   if(e.target.open){ if(!openLogs.has(id)){ openLogs.add(id); pollJobs(); } } else openLogs.delete(id);
 }, true);
 $('#jobsClear').onclick = async () => { try{ await api('/api/jobs/clear', {}); pollJobs(); }catch(e){ toast(e.message); } };
+
+// ---------- резервная копия ----------
+$('#bkBtn').onclick = async () => {
+  $('#bkErr').textContent = '';
+  const p1 = $('#bkPwd').value, p2 = $('#bkPwd2').value;
+  if(p1.length < 8){ $('#bkErr').textContent = 'Пароль копии — не короче 8 символов'; return; }
+  if(p1 !== p2){ $('#bkErr').textContent = 'Пароли не совпадают'; return; }
+  const b = $('#bkBtn'); b.disabled = true; b.textContent = 'Шифрую…';
+  try{
+    const r = await fetch('/api/backup', {method: 'POST', credentials: 'same-origin', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({password: p1})});
+    if(!r.ok){ const d = await r.json().catch(() => ({})); throw new Error(d.detail || 'Ошибка ' + r.status); }
+    const blob = await r.blob(), name = (r.headers.get('Content-Disposition') || '').match(/filename="([^"]+)"/);
+    const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name ? name[1] : 'tg-video-panel-backup.tvpbak';
+    document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    $('#bkPwd').value = $('#bkPwd2').value = '';
+    toast('Резервная копия скачана');
+  }catch(e){ $('#bkErr').textContent = e.message; }
+  b.disabled = false; b.textContent = 'Скачать копию';
+};
+async function doRestore(p){
+  $('#' + p + 'Err').textContent = '';
+  const f = $('#' + p + 'File').files[0], pwd = $('#' + p + 'Pwd').value;
+  if(!f){ $('#' + p + 'Err').textContent = 'Выберите файл .tvpbak'; return; }
+  if(!pwd){ $('#' + p + 'Err').textContent = 'Введите пароль копии'; return; }
+  if(!await askConfirm('Восстановить из копии? Текущие ключи Telegram, вход в Telegram, подключение Диска и настройки будут заменены.', 'Восстановить')) return;
+  const b = $('#' + p + 'Btn'); b.disabled = true; b.textContent = 'Восстанавливаю…';
+  try{
+    const fd = new FormData(); fd.append('file', f); fd.append('password', pwd);
+    const r = await fetch('/api/backup/restore', {method: 'POST', credentials: 'same-origin', body: fd});
+    const d = await r.json().catch(() => ({}));
+    if(!r.ok) throw new Error(d.detail || 'Ошибка ' + r.status);
+    toast('Восстановлено' + (d.authorized ? ': Telegram — ' + (d.me || 'подключён') : '') + (d.yandex ? ', Яндекс Диск подключён' : ''));
+    setTimeout(() => location.reload(), 1500);
+  }catch(e){ $('#' + p + 'Err').textContent = e.message; }
+  b.disabled = false; b.textContent = 'Восстановить';
+}
+$('#rs1Btn').onclick = () => doRestore('rs1');
+$('#rs2Btn').onclick = () => doRestore('rs2');
 
 // ---------- обновления ----------
 let UPD = null;
