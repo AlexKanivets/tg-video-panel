@@ -4,6 +4,11 @@
 — исправления повышают последнюю цифру, новые возможности — среднюю, несовместимые изменения — первую.
 Текущая версия видна в шапке панели и в выводе установщика.
 
+## [1.3.1] — 2026-10-10
+
+### Исправлено
+- Настройки очистки: поля с числами стоят рядом со своими подписями.
+
 ## [1.3.0] — 2026-10-10
 
 ### Добавлено
@@ -67,6 +72,7 @@
 - Установщик для Ubuntu 22.04/24.04: режимы по IP, с доменом (HTTPS через Caddy, без перезаписи чужого
   Caddyfile) и через SSH-туннель.
 
+[1.3.1]: https://github.com/AlexKanivets/tg-video-panel/releases/tag/v1.3.1
 [1.3.0]: https://github.com/AlexKanivets/tg-video-panel/releases/tag/v1.3.0
 [1.2.0]: https://github.com/AlexKanivets/tg-video-panel/releases/tag/v1.2.0
 [1.1.0]: https://github.com/AlexKanivets/tg-video-panel/releases/tag/v1.1.0

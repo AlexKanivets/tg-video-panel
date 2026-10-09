@@ -16,7 +16,7 @@ Telegram Video Panel — панель для пакетного скачиван
 
 # Версия панели (семантическая: исправления → 1.0.1, новые возможности → 1.1.0, несовместимые изменения → 2.0.0).
 # Меняется при каждом изменении кода; что изменилось — в CHANGELOG.md.
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 
 import asyncio
 import hashlib
@@ -2420,12 +2420,12 @@ PAGE = r"""<!doctype html>
       в «Скачанных видео» с пометкой «в архиве» — видео можно вернуть кнопкой «Восстановить с Диска».
       Проверка — каждые 30 минут и после каждого задания.</p>
     <div class="row" style="align-items:center">
-      <label class="check" style="margin:0"><input type="checkbox" id="stCleanAge"> Удалять видео старше</label>
+      <label class="check fit" style="margin:0"><input type="checkbox" id="stCleanAge"> Удалять видео старше</label>
       <div class="fit"><input type="number" id="stCleanDays" min="1" max="3650" style="width:90px"></div>
       <div class="fit muted">дней</div>
     </div>
     <div class="row" style="align-items:center;margin-top:8px">
-      <label class="check" style="margin:0"><input type="checkbox" id="stCleanSpace"> Удалять самые старые, когда свободно меньше</label>
+      <label class="check fit" style="margin:0"><input type="checkbox" id="stCleanSpace"> Удалять самые старые, когда свободно меньше</label>
       <div class="fit"><input type="number" id="stCleanGb" min="1" style="width:90px"></div>
       <div class="fit muted">ГБ</div>
     </div>
