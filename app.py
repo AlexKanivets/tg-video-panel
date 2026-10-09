@@ -16,7 +16,7 @@ Telegram Video Panel — панель для пакетного скачиван
 
 # Версия панели (семантическая: исправления → 1.0.1, новые возможности → 1.1.0, несовместимые изменения → 2.0.0).
 # Меняется при каждом изменении кода; что изменилось — в CHANGELOG.md.
-VERSION = "1.7.2"
+VERSION = "1.7.3"
 
 import asyncio
 import io
@@ -2514,6 +2514,7 @@ details.sblock[open]>summary::after{transform:rotate(-135deg)}
 details.sblock[open]>summary{margin-bottom:12px}
 details.sblock:not([open]){padding-top:16px;padding-bottom:16px}
 details.sblock>summary:hover h2{color:var(--accent)}
+.arch{text-decoration:line-through;text-decoration-thickness:1.5px;opacity:.65}
 .card h3{font-size:14px;margin:20px 0 6px;padding-top:14px;border-top:1px solid var(--line)}
 .card p.hint{margin:0 0 14px;color:var(--muted);font-size:14px}
 .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.25fr);gap:18px}
@@ -3230,11 +3231,12 @@ function comboOpen(filter){
   const q = (filter || '').trim().toLowerCase();
   const list = serverFolders.filter(g => !q || g.name.toLowerCase().includes(q));
   comboItems = [{name:'', label:'Не задано', note:'дата и название группы'}].concat(
-    list.map(g => ({name:g.name, label:g.name, note:g.files.length + ' видео'})));
+    list.map(g => ({name:g.name, label:g.name, arch: !!(g.archived && !g.files.length),
+                    note: g.archived && !g.files.length ? 'в архиве на Диске' : g.files.length + ' видео'})));
   const cur = $('#folder').value.trim();
   comboActive = Math.max(0, comboItems.findIndex(i => i.name === cur));
   $('#folderList').innerHTML = comboItems.map((it, i) =>
-    `<div class="combo-opt ${i===comboActive?'active':''} ${it.name?'':'empty'}" role="option" id="fopt${i}" data-i="${i}" aria-selected="${i===comboActive}"><span>${it.name ? '📁 ' + esc(it.label) : esc(it.label)}</span><span class="t">${esc(it.note)}</span></div>` +
+    `<div class="combo-opt ${i===comboActive?'active':''} ${it.name?'':'empty'}" role="option" id="fopt${i}" data-i="${i}" aria-selected="${i===comboActive}"><span class="${it.arch ? 'arch' : ''}">${it.name ? '📁 ' + esc(it.label) : esc(it.label)}</span><span class="t">${esc(it.note)}</span></div>` +
     (i === 0 ? (list.length ? '<div class="combo-sep"></div>' : `<div class="combo-opt empty" style="cursor:default">${serverFolders.length ? 'Нет совпадений — будет новая папка' : 'Папок на сервере пока нет'}</div>`) : '')).join('');
   show($('#folderList'));
   $('#folder').setAttribute('aria-expanded', 'true');
@@ -3302,7 +3304,7 @@ async function loadFiles(){
   if(!d.groups.length){ $('#filesList').innerHTML = '<p class="muted" style="margin:14px 0 0">Пока пусто.</p>'; return; }
   $('#filesList').innerHTML = d.groups.map(g => `
     <details class="fgroup" data-g="${esc(g.name)}" ${openGroups.has(g.name)?'open':''}>
-      <summary><b>📁 ${esc(g.name)}</b>${g.files.length || !g.archived ? `<span class="pill">${g.files.length} · ${human(g.size)}</span>` : ''}
+      <summary><b class="${g.archived && !g.files.length ? 'arch' : ''}" ${g.archived && !g.files.length ? 'title="Видео удалены с сервера, лежат на Яндекс Диске — можно восстановить"' : ''}>📁 ${esc(g.name)}</b>${g.files.length || !g.archived ? `<span class="pill">${g.files.length} · ${human(g.size)}</span>` : ''}
         ${g.archived ? `<span class="pill" title="Видео удалены с сервера после проверки, лежат на Яндекс Диске">☁ в архиве · ${g.archived.count} · ${human(g.archived.size)}</span>` : ''}
         ${g.busy ? '<span class="pill st-running">в работе</span>' : ''}
         <span class="icons">

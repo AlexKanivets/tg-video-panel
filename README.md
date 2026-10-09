@@ -268,7 +268,7 @@ sudo docker compose up -d --build      # Docker Compose
 ```bash
 cd ~/tg-video-panel
 git fetch --tags
-sudo git checkout v1.7.2
+sudo git checkout v1.7.3
 sudo bash install.sh --ip
 ```
 
