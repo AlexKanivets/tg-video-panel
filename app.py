@@ -16,7 +16,7 @@ Telegram Video Panel — панель для пакетного скачиван
 
 # Версия панели (семантическая: исправления → 1.0.1, новые возможности → 1.1.0, несовместимые изменения → 2.0.0).
 # Меняется при каждом изменении кода; что изменилось — в CHANGELOG.md.
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 import asyncio
 import hashlib
@@ -356,6 +356,9 @@ DEFAULT_SETTINGS = {
     "auto_upload": False,                # загружать на Диск по мере скачивания (только если Диск подключён)
     "archive": False,                    # после проверки загрузки удалять видео с сервера (папка — «в архиве»)
     "info_file": True,                   # создавать info.txt (текст сообщения со ссылкой) в папке сервера и Диска
+    "clean_age": False, "clean_age_days": 30,      # автоочистка: удалять видео старше N дней (только если есть на Диске)
+    "clean_space": False, "clean_space_gb": 5,     # …или самые старые, пока свободного места меньше X ГБ
+    "warn_space_gb": 3,                            # предупреждать, когда свободного места меньше Y ГБ
     "dl_jobs": 2,                        # заданий на скачивание одновременно
     "tg_parallel": 3,                    # видео из Telegram одновременно (всего)
     "ya_parallel": 3,                    # файлов на/с Яндекс Диска одновременно (всего)
@@ -764,7 +767,15 @@ async def run_job(j):
                     j[part]["active"] = {}
             if j.get("ya"):
                 j["ya"].update(waiting=False, retry=None)
+            asyncio.create_task(cleanup_after_job())
         wake_scheduler()
+
+
+async def cleanup_after_job():
+    try:
+        await cleanup_run("после задания")
+    except Exception as e:
+        clog(f"⚠ ошибка очистки: {e}")
 
 
 async def cancel_all(tasks):
@@ -1168,6 +1179,116 @@ async def ya_get(j, h, remote, name, size, folder):
         mark()
 
 
+
+# ---------- автоочистка сервера ----------
+#
+# Удаляет с сервера видео, которые точно есть на Яндекс Диске (имя + размер), через механизм архива:
+# папка остаётся в списке «в архиве», видео восстанавливаются с Диска. Правила (в настройках):
+# старше N дней и/или самые старые, пока свободного места меньше X ГБ. Папки с заданиями не трогаем.
+
+GIB = 1 << 30
+cleanup = {"running": False, "last": None, "reason": "", "deleted": 0, "freed": 0, "log": []}
+cleanup_lock = asyncio.Lock()
+
+
+def clog(msg):
+    cleanup["log"].append(f"{datetime.now():%d.%m %H:%M}  {msg}")
+    del cleanup["log"][:-100]
+
+
+def disk_free() -> int:
+    DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
+    return shutil.disk_usage(DOWNLOAD_ROOT).free
+
+
+async def cleanup_run(reason="по расписанию") -> dict:
+    st = get_settings()
+    if not (st.get("clean_age") or st.get("clean_space")):
+        return {"skipped": "автоочистка выключена"}
+    if not ya_conf().get("token"):
+        return {"skipped": "Яндекс Диск не подключён — без него очистка ничего не удаляет"}
+    if cleanup_lock.locked():
+        return {"skipped": "очистка уже идёт"}
+    async with cleanup_lock:
+        cleanup.update(running=True, reason=reason)
+        deleted = freed = 0
+        try:
+            now = time.time()
+            files = []  # (mtime, size, folder, path) — кандидаты из свободных папок
+            for d in sorted(DOWNLOAD_ROOT.iterdir()) if DOWNLOAD_ROOT.is_dir() else []:
+                if d.is_dir() and not folder_jobs(d.name):
+                    for f in local_videos(d):
+                        stt = f.stat()
+                        files.append((stt.st_mtime, stt.st_size, d, f))
+            files.sort(key=lambda x: x[0])
+            pick = set()
+            if st.get("clean_age"):
+                limit = now - max(1, int(st["clean_age_days"])) * 86400
+                pick.update(f for m, _, _, f in files if m < limit)
+            if st.get("clean_space"):
+                need = max(1, int(st["clean_space_gb"])) * GIB - disk_free()
+                for m, size, _, f in files:
+                    if need <= 0:
+                        break
+                    if f not in pick:
+                        pick.add(f)
+                    need -= size
+            if not pick:
+                return {"deleted": 0, "freed": 0}
+            by_folder = {}
+            for _, size, d, f in files:
+                if f in pick:
+                    by_folder.setdefault(d, []).append(f)
+            root = ya_root_path()
+            async with ya_client() as h:
+                for d, flist in by_folder.items():
+                    if folder_jobs(d.name):
+                        continue  # пока собирали список, с папкой начало работать задание
+                    a = load_archive(d)
+                    remote = a.get("remote") or f"{root}/{d.name}"
+                    try:
+                        on_disk = await ya_list(h, remote)
+                        r = await h.get(YA_API + "/resources", params={"path": remote, "fields": "public_url"})
+                        link = r.json().get("public_url") if r.status_code == 200 else a.get("link")
+                    except Exception as e:
+                        clog(f"⚠ «{d.name}»: не удалось проверить Диск ({e}) — пропускаю")
+                        continue
+                    ok_files = [f for f in flist if f.exists() and on_disk.get(f.name) == f.stat().st_size]
+                    missing = len(flist) - len(ok_files)
+                    if missing:
+                        clog(f"«{d.name}»: {missing} видео нет на Диске (или отличаются) — не удаляю их")
+                    if not ok_files:
+                        continue
+                    size = sum(f.stat().st_size for f in ok_files)
+                    archive_folder(d, remote, link, ok_files)
+                    deleted += len(ok_files)
+                    freed += size
+                    clog(f"🧹 «{d.name}»: удалено с сервера {len(ok_files)} видео, освобождено {human(size)} "
+                         f"(есть на Диске, можно восстановить)")
+            return {"deleted": deleted, "freed": freed}
+        finally:
+            cleanup.update(running=False, last=time.time(), deleted=deleted, freed=freed)
+            if deleted:
+                clog(f"Итого ({reason}): {deleted} видео, {human(freed)}; свободно {human(disk_free())}")
+
+
+async def cleanup_loop():
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await cleanup_run()
+        except Exception as e:
+            clog(f"⚠ ошибка очистки: {e}")
+        await asyncio.sleep(1800)
+
+
+def space_info() -> dict:
+    st = get_settings()
+    free = disk_free()
+    warn = max(0, float(st.get("warn_space_gb") or 0)) * GIB
+    return {"free": free, "warn": bool(warn) and free < warn, "warn_gb": st.get("warn_space_gb")}
+
+
 # ---------- HTTP-обработчики ----------
 
 async def body(request: Request) -> dict:
@@ -1365,8 +1486,17 @@ async def jobs_list(request: Request):
     lst = sorted(jobs.values(), key=lambda j: (order.get(j["status"], 2),
                                                j["created"] if j["status"] == "queued" else -(j.get("finished") or j["created"])))
     st = get_settings()
-    return ok({"jobs": [job_public(j, j["id"] in want) for j in lst],
+    return ok({"jobs": [job_public(j, j["id"] in want) for j in lst], "space": space_info(),
                "limits": {"dl_jobs": st["dl_jobs"], "tg_parallel": st["tg_parallel"], "ya_parallel": st["ya_parallel"]}})
+
+
+async def cleanup_get(request: Request):
+    return ok(dict(cleanup, space=space_info()))
+
+
+async def cleanup_now(request: Request):
+    res = await cleanup_run("вручную")
+    return ok(dict(res, space=space_info(), log=cleanup["log"][-20:]))
 
 
 async def jobs_stop(request: Request):
@@ -1551,6 +1681,15 @@ async def settings_set(request: Request):
                 raise HTTPException(400, "Параллельность — целое число")
     if "archive" in b:
         st["archive"] = bool(b["archive"])
+    for k in ("clean_age", "clean_space"):
+        if k in b:
+            st[k] = bool(b[k])
+    for k, lo, hi in (("clean_age_days", 1, 3650), ("clean_space_gb", 1, 100000), ("warn_space_gb", 0, 100000)):
+        if k in b:
+            try:
+                st[k] = max(lo, min(hi, int(b[k])))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "Параметры очистки — целые числа")
     if "info_file" in b:
         st["info_file"] = bool(b["info_file"])
     if "auto_upload" in b:
@@ -1900,11 +2039,13 @@ async def lifespan(_app):
     jobs_state["wake"] = asyncio.Event()
     load_jobs()
     loop_task = asyncio.create_task(jobs_loop())
+    clean_task = asyncio.create_task(cleanup_loop())
     wake_scheduler()
     yield
     jobs_state["shutdown"] = True  # незавершённые задания остаются «в работе» и продолжатся после запуска
     await cancel_all(list(job_tasks.values()))
     loop_task.cancel()
+    clean_task.cancel()
     try:
         save_jobs()
     except Exception as e:
@@ -1930,6 +2071,8 @@ routes = [
     Route("/api/jobs/stop", jobs_stop, methods=["POST"]),
     Route("/api/jobs/retry", jobs_retry, methods=["POST"]),
     Route("/api/jobs/clear", jobs_clear, methods=["POST"]),
+    Route("/api/cleanup", cleanup_get),
+    Route("/api/cleanup/run", cleanup_now, methods=["POST"]),
     Route("/api/restore", restore_start, methods=["POST"]),
     Route("/api/open_folder", open_folder, methods=["POST"]),
     Route("/api/files", files),
@@ -1977,6 +2120,11 @@ header .me{margin-left:auto;color:var(--muted);font-size:14px;display:flex;gap:6
 main{max-width:1100px;margin:0 auto;padding:20px 16px;display:grid;gap:18px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;min-width:0}
 .card h2{margin:0 0 4px;font-size:16px}
+.spacewarn{background:#fef3c7;color:#78350f;border:1px solid #f59e0b;border-radius:10px;padding:10px 14px;font-size:14px}
+.spacewarn a{color:inherit;font-weight:600}
+@media (prefers-color-scheme: dark){.spacewarn{background:#3b2a07;color:#fde68a;border-color:#b45309}}
+.disk.low #diskText{color:var(--err);font-weight:600}
+.disk.low .bar>div{background:var(--err)}
 .loader{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;padding:56px 0;color:var(--muted);font-size:14px}
 .loader.sm{flex-direction:row;padding:16px 12px;gap:10px;font-size:13px}
 .spinner{width:30px;height:30px;border:3px solid var(--track);border-top-color:var(--accent);border-radius:50%;animation:spin .8s linear infinite;flex:0 0 auto}
@@ -2127,6 +2275,7 @@ PAGE = r"""<!doctype html>
 <main>
   <div class="err" id="globalErr" style="margin:0"></div>
   <div class="loader hidden" id="pageLoader" role="status"><div class="spinner"></div><span>Загрузка...</span></div>
+  <div class="spacewarn hidden" id="spaceWarn" role="alert"></div>
   <section class="card hidden" id="jobsCard">
     <div class="row" style="align-items:center">
       <div><h2>Задания</h2><p class="hint" style="margin:0" id="jobsHint"></p></div>
@@ -2264,6 +2413,30 @@ PAGE = r"""<!doctype html>
       <div><label>Видео из Telegram одновременно (всего)</label><input type="number" id="stTg" min="1" max="8"></div>
       <div><label>Файлов на Яндекс Диск одновременно (всего)</label><input type="number" id="stYa" min="1" max="8"></div>
     </div>
+  </section>
+  <section class="card" id="cleanCard">
+    <h2>Очистка сервера</h2>
+    <p class="hint">Удаляются только видео, которые точно есть на Яндекс Диске (сверка имени и размера). Папка остаётся
+      в «Скачанных видео» с пометкой «в архиве» — видео можно вернуть кнопкой «Восстановить с Диска».
+      Проверка — каждые 30 минут и после каждого задания.</p>
+    <div class="row" style="align-items:center">
+      <label class="check" style="margin:0"><input type="checkbox" id="stCleanAge"> Удалять видео старше</label>
+      <div class="fit"><input type="number" id="stCleanDays" min="1" max="3650" style="width:90px"></div>
+      <div class="fit muted">дней</div>
+    </div>
+    <div class="row" style="align-items:center;margin-top:8px">
+      <label class="check" style="margin:0"><input type="checkbox" id="stCleanSpace"> Удалять самые старые, когда свободно меньше</label>
+      <div class="fit"><input type="number" id="stCleanGb" min="1" style="width:90px"></div>
+      <div class="fit muted">ГБ</div>
+    </div>
+    <div class="row" style="align-items:center;margin-top:8px">
+      <div class="fit" style="font-size:14px">Предупреждать, когда свободно меньше</div>
+      <div class="fit"><input type="number" id="stWarnGb" min="0" style="width:90px"></div>
+      <div class="fit muted">ГБ (0 — не предупреждать)</div>
+    </div>
+    <div class="muted" id="cleanHint" style="font-size:13px;margin-top:8px"></div>
+    <div style="margin-top:12px"><button class="sm" id="cleanNow" type="button">Очистить сейчас</button> <span class="muted" id="cleanRes" style="font-size:13px"></span></div>
+    <details class="logwrap"><summary>Журнал очистки</summary><div class="log" id="cleanLog" style="height:140px"></div></details>
   </section>
   <section class="card" id="yaSettingsCard">
     <div class="row" style="align-items:center"><div><h2>Яндекс Диск</h2></div><div class="fit"><span class="pill" id="yaPill"></span></div></div>
@@ -2626,6 +2799,7 @@ async function loadFiles(){
   $('#rootPath').textContent = 'Папка на сервере: ' + d.root;
   const pct = d.disk.total ? d.disk.used / d.disk.total * 100 : 0;
   $('#diskText').textContent = `Свободно ${human(d.disk.free)} из ${human(d.disk.total)}`;
+  $('.disk').classList.toggle('low', !!(SPACE && SPACE.warn));
   $('#diskBar').style.width = pct + '%';
   serverFolders = d.groups.filter(g => g.name !== '(корень)');
   renderFolderPick();
@@ -2698,6 +2872,10 @@ async function loadSettings(){
   $('#stJobs').value = ST.dl_jobs; $('#stTg').value = ST.tg_parallel; $('#stYa').value = ST.ya_parallel;
   $('#stArchive').checked = !!ST.archive; $('#stArchive').disabled = !YA.connected;
   $('#stInfo').checked = ST.info_file !== false;
+  $('#stCleanAge').checked = !!ST.clean_age; $('#stCleanDays').value = ST.clean_age_days;
+  $('#stCleanSpace').checked = !!ST.clean_space; $('#stCleanGb').value = ST.clean_space_gb; $('#stWarnGb').value = ST.warn_space_gb;
+  $('#cleanHint').textContent = YA.connected ? '' : '⚠ Яндекс Диск не подключён — пока он не подключён, очистка ничего не удаляет.';
+  loadCleanup();
   $('#stAuto').checked = YA.connected && !!ST.auto_upload;
   $('#stAuto').disabled = !YA.connected;
   $('#stAutoHint').textContent = YA.connected ? '' : 'Доступно после подключения Яндекс Диска.';
@@ -2728,6 +2906,8 @@ $('#stSave').onclick = async () => {
   try{
     const r = await api('/api/settings', {ya_root: $('#stRoot').value, send_link: $('#stSend').checked,
       auto_upload: $('#stAuto').checked && YA.connected, archive: $('#stArchive').checked, info_file: $('#stInfo').checked,
+      clean_age: $('#stCleanAge').checked, clean_age_days: $('#stCleanDays').value,
+      clean_space: $('#stCleanSpace').checked, clean_space_gb: $('#stCleanGb').value, warn_space_gb: $('#stWarnGb').value,
       dl_jobs: $('#stJobs').value, tg_parallel: $('#stTg').value, ya_parallel: $('#stYa').value,
       target: $('#stTarget').value, target_chat: $('#stTarget').value === 'chat' ? sel.value : null,
       target_name: chatName, template: $('#stTpl').value});
@@ -2885,6 +3065,7 @@ async function pollJobs(){
   let d;
   try{ d = await api('/api/jobs?logs=' + [...openLogs].join(',')); }catch(e){ jobsTimer = setTimeout(pollJobs, 4000); return; }
   JOBS = d.jobs;
+  renderSpace(d.space);
   const active = JOBS.filter(j => j.status === 'running' || j.status === 'queued').length;
   if(active < prevActive){ if(S.server) loadFiles(); if(YA.connected){ loadSettings(); } }
   prevActive = active;
@@ -2900,6 +3081,36 @@ $('#jobsList').addEventListener('toggle', e => {
   if(e.target.open){ if(!openLogs.has(id)){ openLogs.add(id); pollJobs(); } } else openLogs.delete(id);
 }, true);
 $('#jobsClear').onclick = async () => { try{ await api('/api/jobs/clear', {}); pollJobs(); }catch(e){ toast(e.message); } };
+
+// ---------- место на сервере и очистка ----------
+let SPACE = null;
+function renderSpace(sp){
+  SPACE = sp;
+  const w = $('#spaceWarn');
+  show(w, !!(sp && sp.warn));
+  if(sp && sp.warn) setHtml(w, `⚠ На сервере осталось <b>${human(sp.free)}</b> свободного места (порог предупреждения — ${sp.warn_gb} ГБ).
+    Новые видео могут не поместиться. Включите автоочистку или удалите ненужное — <a href="#" data-goset="1">настройки очистки</a>.`);
+  const dk = document.querySelector('.disk'); if(dk) dk.classList.toggle('low', !!(sp && sp.warn));
+}
+$('#spaceWarn').onclick = e => { if(e.target.dataset.goset){ e.preventDefault(); setTab('set'); $('#cleanCard').scrollIntoView({behavior:'smooth'}); } };
+async function loadCleanup(){
+  try{
+    const c = await api('/api/cleanup');
+    $('#cleanLog').textContent = c.log.join('\n') || 'Пока ничего не удалялось.';
+    $('#cleanRes').textContent = c.last ? `Последняя проверка: ${new Date(c.last * 1000).toLocaleString()}` + (c.deleted ? ` · удалено ${c.deleted} видео, ${human(c.freed)}` : '') : '';
+    renderSpace(c.space);
+  }catch(e){}
+}
+$('#cleanNow').onclick = async () => {
+  const b = $('#cleanNow'); b.disabled = true; $('#cleanRes').textContent = 'Проверяю…';
+  try{
+    const r = await api('/api/cleanup/run', {});
+    $('#cleanRes').textContent = r.skipped ? r.skipped : r.deleted ? `Удалено ${r.deleted} видео, освобождено ${human(r.freed)}` : 'Удалять нечего — правила не сработали';
+    $('#cleanLog').textContent = (r.log || []).join('\n') || 'Пока ничего не удалялось.';
+    renderSpace(r.space); if(S.server) loadFiles();
+  }catch(e){ $('#cleanRes').textContent = e.message; }
+  b.disabled = false;
+};
 
 // ---------- вкладки ----------
 let currentTab = 'tg';
