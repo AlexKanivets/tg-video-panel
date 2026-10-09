@@ -16,7 +16,7 @@ Telegram Video Panel — панель для пакетного скачиван
 
 # Версия панели (семантическая: исправления → 1.0.1, новые возможности → 1.1.0, несовместимые изменения → 2.0.0).
 # Меняется при каждом изменении кода; что изменилось — в CHANGELOG.md.
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 
 import asyncio
 import io
@@ -2584,7 +2584,8 @@ details.logwrap>summary{cursor:pointer;color:var(--muted);font-size:13px;margin-
 .modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:grid;place-items:center;z-index:50;padding:16px}
 .modal-box{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;width:min(480px,100%);max-height:88vh;display:flex;flex-direction:column}
 .modal-box .list{max-height:52vh}
-.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:10px 16px;border-radius:10px;font-size:14px;z-index:60;max-width:calc(100% - 32px)}
+#confirmModal{z-index:65}  /* подтверждение всегда поверх других окон */
+.toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:10px 16px;border-radius:10px;font-size:14px;z-index:70;max-width:calc(100% - 32px)}
 .combo{position:relative}
 .combo input{padding-right:40px}
 .combo .arrow{position:absolute;right:5px;top:50%;transform:translateY(-50%);width:30px;height:30px;padding:0;border:0;background:none;color:var(--muted);display:grid;place-items:center;border-radius:7px}
