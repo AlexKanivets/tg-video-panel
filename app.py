@@ -16,7 +16,7 @@ Telegram Video Panel — панель для пакетного скачиван
 
 # Версия панели (семантическая: исправления → 1.0.1, новые возможности → 1.1.0, несовместимые изменения → 2.0.0).
 # Меняется при каждом изменении кода; что изменилось — в CHANGELOG.md.
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 
 import asyncio
 import io
@@ -1541,7 +1541,14 @@ async def jobs_list(request: Request):
                                                j["created"] if j["status"] == "queued" else -(j.get("finished") or j["created"])))
     st = get_settings()
     return ok({"jobs": [job_public(j, j["id"] in want) for j in lst], "space": space_info(),
+               "version": VERSION,
                "limits": {"dl_jobs": st["dl_jobs"], "tg_parallel": st["tg_parallel"], "ya_parallel": st["ya_parallel"]}})
+
+
+async def legacy_poll(request: Request):
+    # вкладки, открытые до версии 1.2 (до «Заданий»), опрашивают /api/job и /api/ya/job; на 403 их код
+    # перезагружает страницу — так они сами переходят на новую версию
+    return JSONResponse({"detail": "Панель обновилась — обновите страницу"}, status_code=403)
 
 
 # ---------- резервная копия (зашифрованная) ----------
@@ -2417,6 +2424,8 @@ routes = [
     Route("/api/count/{chat_id}", count),
     Route("/api/start", start, methods=["POST"]),
     Route("/api/jobs", jobs_list),
+    Route("/api/job", legacy_poll),
+    Route("/api/ya/job", legacy_poll),
     Route("/api/jobs/stop", jobs_stop, methods=["POST"]),
     Route("/api/jobs/retry", jobs_retry, methods=["POST"]),
     Route("/api/jobs/clear", jobs_clear, methods=["POST"]),
@@ -2684,6 +2693,7 @@ PAGE = r"""<!doctype html>
 <main>
   <div class="err" id="globalErr" style="margin:0"></div>
   <div class="loader hidden" id="pageLoader" role="status"><div class="spinner"></div><span>Загрузка...</span></div>
+  <div class="spacewarn hidden" id="reloadBar" role="status"></div>
   <div class="spacewarn hidden" id="spaceWarn" role="alert"></div>
   <section class="card hidden" id="jobsCard">
     <div class="row" style="align-items:center">
@@ -3019,6 +3029,7 @@ window.onunhandledrejection = function(e){ tvpShowError(e && e.reason && e.reaso
 </script>
 <script>
 const $ = s => document.querySelector(s);
+const PAGE_VERSION = '""" + VERSION + r"""';
 const ICON = {
   refresh: '<path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/>',
   zip: '<rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V8"/><path d="M12 11v6"/><path d="m9.5 14.5 2.5 2.5 2.5-2.5"/>',
@@ -3063,9 +3074,17 @@ async function api(path, body, timeoutMs){
   let timer = null;
   if(timeoutMs){ const ac = new AbortController(); opt.signal = ac.signal; timer = setTimeout(() => ac.abort(), timeoutMs); }
   let r;
-  try{ r = await fetch(path, opt); }
-  catch(e){ throw new Error(e.name === 'AbortError' ? 'нет ответа за ' + Math.round(timeoutMs/1000) + ' с' : 'запрос не прошёл (' + e.message + ')'); }
-  finally{ clearTimeout(timer); }
+  // сервер может на полминуты перезапускаться (обновление) — повторяем запрос, а не сдаёмся сразу
+  for(let attempt = 0; ; attempt++){
+    try{ r = await fetch(path, opt); break; }
+    catch(e){
+      if(e.name === 'AbortError'){ clearTimeout(timer); throw new Error('нет ответа за ' + Math.round(timeoutMs/1000) + ' с'); }
+      if(attempt >= 3){ clearTimeout(timer); throw new Error('сервер не отвечает — возможно, он перезапускается; попробуйте через минуту (' + e.message + ')'); }
+      if(body !== undefined && typeof toast === 'function') toast('Сервер недоступен (возможно, перезапускается) — повторяю…');
+      await new Promise(res => setTimeout(res, 2000 * (attempt + 1)));
+    }
+  }
+  clearTimeout(timer);
   if(r.status === 403){ location.reload(); throw new Error('Нужно войти'); }
   const d = await r.json().catch(() => ({}));
   if(!r.ok) throw new Error(typeof d.detail === 'string' ? d.detail : (r.statusText || 'Ошибка'));
@@ -3546,6 +3565,10 @@ async function pollJobs(){
   try{ d = await api('/api/jobs?logs=' + [...openLogs].join(',')); }catch(e){ jobsTimer = setTimeout(pollJobs, 4000); return; }
   JOBS = d.jobs;
   renderSpace(d.space);
+  if(d.version && d.version !== PAGE_VERSION && $('#reloadBar').classList.contains('hidden')){
+    $('#reloadBar').innerHTML = `Панель обновилась до версии ${esc(d.version)} (на этой странице — ${PAGE_VERSION}). <a href="#" onclick="location.reload();return false">Обновить страницу</a>`;
+    show($('#reloadBar'));
+  }
   const active = JOBS.filter(j => j.status === 'running' || j.status === 'queued').length;
   if(active < prevActive){ if(S.server) loadFiles(); if(YA.connected){ loadSettings(); } }
   prevActive = active;
