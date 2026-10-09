@@ -16,7 +16,7 @@ Telegram Video Panel — панель для пакетного скачиван
 
 # Версия панели (семантическая: исправления → 1.0.1, новые возможности → 1.1.0, несовместимые изменения → 2.0.0).
 # Меняется при каждом изменении кода; что изменилось — в CHANGELOG.md.
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 
 import asyncio
 import io
@@ -2497,6 +2497,14 @@ main{max-width:1100px;margin:0 auto;padding:20px 16px;display:grid;gap:18px}
 .loader.sm .spinner{width:18px;height:18px;border-width:2px}
 @keyframes spin{to{transform:rotate(360deg)}}
 @media (prefers-reduced-motion: reduce){.spinner{animation-duration:2.5s}}
+details.sblock>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;user-select:none}
+details.sblock>summary::-webkit-details-marker{display:none}
+details.sblock>summary h2{margin:0}
+details.sblock>summary::after{content:"";margin-left:auto;width:9px;height:9px;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:rotate(45deg);transition:transform .15s;flex:0 0 auto;margin-right:4px}
+details.sblock[open]>summary::after{transform:rotate(-135deg)}
+details.sblock[open]>summary{margin-bottom:12px}
+details.sblock:not([open]){padding-top:16px;padding-bottom:16px}
+details.sblock>summary:hover h2{color:var(--accent)}
 .card h3{font-size:14px;margin:20px 0 6px;padding-top:14px;border-top:1px solid var(--line)}
 .card p.hint{margin:0 0 14px;color:var(--muted);font-size:14px}
 .grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.25fr);gap:18px}
@@ -2815,17 +2823,17 @@ PAGE = r"""<!doctype html>
 </div>
 
 <div class="tabpane hidden" id="tabSet">
-  <section class="card">
-    <h2>Параллельность</h2>
+  <details class="card sblock" id="parCard">
+    <summary><h2>Параллельность</h2></summary>
     <p class="hint">Больше — быстрее, но Telegram может попросить подождать, а сервер тратит больше канала и места.</p>
     <div class="row">
       <div><label>Заданий на скачивание одновременно</label><input type="number" id="stJobs" min="1" max="5"></div>
       <div><label>Видео из Telegram одновременно (всего)</label><input type="number" id="stTg" min="1" max="8"></div>
       <div><label>Файлов на Яндекс Диск одновременно (всего)</label><input type="number" id="stYa" min="1" max="8"></div>
     </div>
-  </section>
-  <section class="card" id="backupCard">
-    <h2>Резервная копия</h2>
+  </details>
+  <details class="card sblock" id="backupCard">
+    <summary><h2>Резервная копия</h2></summary>
     <p class="hint">Один зашифрованный файл: ключи Telegram API, вход в Telegram, подключение Яндекс Диска и все настройки панели.
       Пригодится для переезда на другой сервер. Видео и пароль панели в копию не входят.</p>
     <div class="row">
@@ -2843,15 +2851,15 @@ PAGE = r"""<!doctype html>
         <div class="fit"><button id="rs2Btn" type="button">Восстановить</button></div>
       </div>
       <div class="err" id="rs2Err"></div>
-  </section>
-  <section class="card" id="updCard">
-    <h2>Обновления</h2>
+  </details>
+  <details class="card sblock" id="updCard">
+    <summary><h2>Обновления</h2></summary>
     <label class="check"><input type="checkbox" id="stUpdate"> Проверять новые версии на GitHub (раз в 6 часов)</label>
     <div class="muted" style="font-size:13px;margin-top:4px">Панель только сообщает о новой версии и показывает команду обновления — сама себя она не обновляет.</div>
     <div style="margin-top:10px"><button class="sm" id="updCheckNow" type="button">Проверить сейчас</button> <span class="muted" id="updState" style="font-size:13px"></span></div>
-  </section>
-  <section class="card" id="cleanCard">
-    <h2>Очистка сервера</h2>
+  </details>
+  <details class="card sblock" id="cleanCard">
+    <summary><h2>Очистка сервера</h2></summary>
     <p class="hint">Удаляются только видео, которые точно есть на Яндекс Диске (сверка имени и размера). Папка остаётся
       в «Скачанных видео» с пометкой «в архиве» — видео можно вернуть кнопкой «Восстановить с Диска».
       Проверка — каждые 30 минут и после каждого задания.</p>
@@ -2873,9 +2881,9 @@ PAGE = r"""<!doctype html>
     <div class="muted" id="cleanHint" style="font-size:13px;margin-top:8px"></div>
     <div style="margin-top:12px"><button class="sm" id="cleanNow" type="button">Очистить сейчас</button> <span class="muted" id="cleanRes" style="font-size:13px"></span></div>
     <details class="logwrap"><summary>Журнал очистки</summary><div class="log" id="cleanLog" style="height:140px"></div></details>
-  </section>
-  <section class="card" id="yaSettingsCard">
-    <div class="row" style="align-items:center"><div><h2>Яндекс Диск</h2></div><div class="fit"><span class="pill" id="yaPill"></span></div></div>
+  </details>
+  <details class="card sblock" id="yaSettingsCard">
+    <summary><h2>Яндекс Диск</h2><span class="pill" id="yaPill"></span></summary>
     <h3>Подключение</h3>
       <div id="yaConnected" class="hidden">
         <p style="margin:6px 0" id="yaInfo"></p>
@@ -2928,7 +2936,7 @@ PAGE = r"""<!doctype html>
       </div>
       <label>Текст сообщения и info.txt — можно использовать {folder}, {period}, {count}, {size}, {link}</label>
       <textarea id="stTpl"></textarea>
-  </section>
+  </details>
   <div><button class="primary" id="stSave">Сохранить настройки</button> <span class="ok" id="stSaved"></span></div>
   <div class="err" id="stErr" style="margin:0"></div>
 </div>
@@ -3360,7 +3368,7 @@ function renderAutoStatus(){
 }
 $('#yaAutoStatus').onclick = e => {
   if(e.target.id !== 'yaAutoLink') return;
-  e.preventDefault(); setTab('set'); $('#yaSettingsCard').scrollIntoView({behavior:'smooth'});
+  e.preventDefault(); setTab('set'); $('#yaSettingsCard').open = true; $('#yaSettingsCard').scrollIntoView({behavior:'smooth'});
 };
 function fillChats(){
   const cur = ST.target_chat ? String(ST.target_chat) : '';
@@ -3676,7 +3684,17 @@ function renderSpace(sp){
     Новые видео могут не поместиться. Включите автоочистку или удалите ненужное — <a href="#" data-goset="1">настройки очистки</a>.`);
   const dk = document.querySelector('.disk'); if(dk) dk.classList.toggle('low', !!(sp && sp.warn));
 }
-$('#spaceWarn').onclick = e => { if(e.target.dataset.goset){ e.preventDefault(); setTab('set'); $('#cleanCard').scrollIntoView({behavior:'smooth'}); } };
+$('#spaceWarn').onclick = e => { if(e.target.dataset.goset){ e.preventDefault(); setTab('set'); $('#cleanCard').open = true; $('#cleanCard').scrollIntoView({behavior:'smooth'}); } };
+// блоки настроек сворачиваются; какие раскрыты — помним
+(function(){
+  let open = [];
+  try{ open = JSON.parse(recall('openBlocks') || '[]'); }catch(e){}
+  document.querySelectorAll('details.sblock').forEach(d => { d.open = open.includes(d.id); });
+  $('#tabSet').addEventListener('toggle', e => {
+    if(!e.target.classList || !e.target.classList.contains('sblock')) return;
+    store('openBlocks', JSON.stringify([...document.querySelectorAll('details.sblock')].filter(d => d.open).map(d => d.id)));
+  }, true);
+})();
 async function loadCleanup(){
   try{
     const c = await api('/api/cleanup');
