@@ -1,0 +1,38 @@
+# ===== Секреты и личные данные — никогда не публиковать =====
+# api_id/api_hash Telegram, токен и ключи Яндекс Диска
+config.json
+# вход в Telegram (даёт полный доступ к аккаунту!)
+*.session
+*.session-journal
+tg_session*
+# ключ подписи входа в панель
+.secret
+# пароль панели и прочие переменные окружения
+*.env
+.env
+.env.*
+# история заданий (названия групп и папок)
+jobs.json
+panel.log
+*.tmp
+
+# ===== Скачанные видео и служебные файлы папок =====
+videos/
+telegram_videos/
+.tvp_*
+*.part
+info.txt
+
+# ===== Рабочие заметки (IP серверов, история) — только локально =====
+CLAUDE.md
+.claude/
+
+# ===== Окружение и мусор =====
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
