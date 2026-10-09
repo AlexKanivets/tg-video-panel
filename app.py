@@ -16,7 +16,7 @@ Telegram Video Panel — панель для пакетного скачиван
 
 # Версия панели (семантическая: исправления → 1.0.1, новые возможности → 1.1.0, несовместимые изменения → 2.0.0).
 # Меняется при каждом изменении кода; что изменилось — в CHANGELOG.md.
-VERSION = "1.7.1"
+VERSION = "1.7.2"
 
 import asyncio
 import io
@@ -2695,6 +2695,7 @@ PAGE = r"""<!doctype html>
   <div class="loader hidden" id="pageLoader" role="status"><div class="spinner"></div><span>Загрузка...</span></div>
   <div class="spacewarn hidden" id="reloadBar" role="status"></div>
   <div class="spacewarn hidden" id="spaceWarn" role="alert"></div>
+<div class="tabpane" id="tabTg">
   <section class="card hidden" id="jobsCard">
     <div class="row" style="align-items:center">
       <div><h2>Задания</h2><p class="hint" style="margin:0" id="jobsHint"></p></div>
@@ -2702,7 +2703,6 @@ PAGE = r"""<!doctype html>
     </div>
     <div id="jobsList"></div>
   </section>
-<div class="tabpane" id="tabTg">
 
   <section class="card hidden" id="keysCard">
     <h2>Ключи Telegram API</h2>

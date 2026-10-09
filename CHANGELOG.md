@@ -4,6 +4,11 @@
 — исправления повышают последнюю цифру, новые возможности — среднюю, несовместимые изменения — первую.
 Текущая версия видна в шапке панели и в выводе установщика.
 
+## [1.7.2] — 2026-10-10
+
+### Исправлено
+- Блок «Задания» показывается только на вкладке «Видео», не в «Настройках».
+
 ## [1.7.1] — 2026-10-10
 
 ### Исправлено
@@ -121,6 +126,7 @@
 - Установщик для Ubuntu 22.04/24.04: режимы по IP, с доменом (HTTPS через Caddy, без перезаписи чужого
   Caddyfile) и через SSH-туннель.
 
+[1.7.2]: https://github.com/AlexKanivets/tg-video-panel/releases/tag/v1.7.2
 [1.7.1]: https://github.com/AlexKanivets/tg-video-panel/releases/tag/v1.7.1
 [1.7.0]: https://github.com/AlexKanivets/tg-video-panel/releases/tag/v1.7.0
 [1.6.1]: https://github.com/AlexKanivets/tg-video-panel/releases/tag/v1.6.1
