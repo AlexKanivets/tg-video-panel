@@ -16,13 +16,14 @@ Telegram Video Panel — панель для пакетного скачиван
 
 # Версия панели (семантическая: исправления → 1.0.1, новые возможности → 1.1.0, несовместимые изменения → 2.0.0).
 # Меняется при каждом изменении кода; что изменилось — в CHANGELOG.md.
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 
 import asyncio
 import io
 import sqlite3
 import tempfile
 import hashlib
+import html as htmllib
 import hmac
 import json
 import mimetypes
@@ -1603,6 +1604,172 @@ def open_backup(data: bytes, password: str) -> dict:
     return out
 
 
+# ---------- страница просмотра по секретной ссылке ----------
+#
+# /s/<token> открывается без пароля панели и показывает ТОЛЬКО одну папку: плеер, список видео, скачивание
+# по одному и ZIP. token — 192 бита случайных данных. Ссылки хранятся в data/shares.json {token: {folder,
+# created, expires, views}}; после срока ссылка не работает, любую можно отозвать.
+
+SHARES_FILE = DATA_DIR / "shares.json"
+SHARE_DAYS = (0, 1, 7, 30)  # 0 — бессрочно
+
+
+def load_shares() -> dict:
+    try:
+        d = json.loads(SHARES_FILE.read_text("utf-8"))
+    except Exception:
+        return {}
+    now = time.time()
+    return {t: x for t, x in d.items() if not x.get("expires") or x["expires"] > now}
+
+
+def save_shares(d: dict):
+    tmp = SHARES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(d, ensure_ascii=False), "utf-8")
+    tmp.replace(SHARES_FILE)
+
+
+def share_url(request: Request, token: str) -> str:
+    return str(request.base_url).rstrip("/") + "/s/" + token
+
+
+async def shares_list(request: Request):
+    folder = request.query_params.get("folder")
+    out = [dict(x, token=t, url=share_url(request, t)) for t, x in load_shares().items()
+           if not folder or x["folder"] == folder]
+    out.sort(key=lambda x: x["created"], reverse=True)
+    return ok({"shares": out})
+
+
+async def shares_create(request: Request):
+    b = await body(request)
+    p = server_folder(b.get("folder"))
+    try:
+        days = int(b.get("days", 7))
+    except (TypeError, ValueError):
+        days = -1
+    if days not in SHARE_DAYS:
+        raise HTTPException(400, "Срок — 1, 7, 30 дней или бессрочно")
+    d = load_shares()
+    token = secrets.token_urlsafe(24)
+    d[token] = {"folder": p.name, "created": time.time(), "expires": time.time() + days * 86400 if days else None,
+                "views": 0}
+    save_shares(d)
+    return ok(dict(d[token], token=token, url=share_url(request, token)))
+
+
+async def shares_revoke(request: Request):
+    token = str((await body(request)).get("token") or "")
+    d = load_shares()
+    if d.pop(token, None) is None:
+        raise HTTPException(404, "Ссылка не найдена")
+    save_shares(d)
+    return ok()
+
+
+def shares_rename(old: str, new: str):
+    d = load_shares()
+    changed = False
+    for x in d.values():
+        if x["folder"] == old:
+            x["folder"] = new
+            changed = True
+    if changed:
+        save_shares(d)
+
+
+def shares_drop_folder(name: str):
+    d = load_shares()
+    left = {t: x for t, x in d.items() if x["folder"] != name}
+    if len(left) != len(d):
+        save_shares(left)
+
+
+SHARE_HEADERS = {"X-Robots-Tag": "noindex, nofollow", "Referrer-Policy": "no-referrer", "Cache-Control": "private, no-store"}
+
+
+def share_folder(token: str):
+    x = load_shares().get(token)
+    if not x:
+        return None, None
+    p = DOWNLOAD_ROOT / x["folder"]
+    return (x, p) if p.is_dir() else (None, None)
+
+
+def share_gone():
+    return HTMLResponse(SHARE_PAGE.replace("<!--T-->", "Ссылка недействительна").replace(
+        "<!--B-->", '<section class="card"><h2>Ссылка недействительна</h2><p class="hint">Срок действия истёк, '
+                    'ссылку отозвали или папку удалили. Попросите прислать новую ссылку.</p></section>'),
+        status_code=404, headers=SHARE_HEADERS)
+
+
+async def share_page(request: Request):
+    token = request.path_params["token"]
+    x, p = share_folder(token)
+    if not x:
+        return share_gone()
+    d = load_shares()
+    d[token]["views"] = d[token].get("views", 0) + 1
+    save_shares(d)
+    e = htmllib.escape
+    vids = sorted(local_videos(p), key=lambda f: f.name.lower())
+    total = sum(f.stat().st_size for f in vids)
+    until = f"до {datetime.fromtimestamp(x['expires']):%d.%m.%Y %H:%M}" if x.get("expires") else "бессрочно"
+    base = f"/s/{token}"
+    meta = [f"{len(vids)} видео · {human(total)}"]
+    per = period_text(p)
+    if per != "не указан":
+        meta.append(f"период {per}")
+    meta.append(f"ссылка действует {until}")
+    if vids:
+        first = f"{base}/f/{quote(vids[0].name)}"
+        items = "".join(
+            f'<div class="pitem{" on" if i == 0 else ""}" data-src="{base}/f/{quote(f.name)}" data-name="{e(f.name)}">'
+            f'<span class="n">▶ {e(f.name)}</span><span class="muted">{human(f.stat().st_size)}</span>'
+            f'<a class="btn sm" href="{base}/f/{quote(f.name)}?dl=1" title="Скачать" aria-label="Скачать {e(f.name)}">⤓</a></div>'
+            for i, f in enumerate(vids))
+        content = (f'<section class="card"><video id="pl" controls playsinline preload="metadata" src="{first}"></video>'
+                   f'<div class="now" id="now">{e(vids[0].name)}</div>'
+                   f'<a class="btn" href="{base}/zip">Скачать всё одним архивом (ZIP, {human(total)})</a></section>'
+                   f'<section class="card"><div class="plist" id="plist">{items}</div></section>')
+    else:
+        a = load_archive(p)
+        link = a.get("link") if a else None
+        content = ('<section class="card"><h2>Видео перенесены на Яндекс Диск</h2>'
+                   + (f'<p><a class="btn primary" href="{e(link)}" rel="noopener">Открыть на Яндекс Диске</a></p>' if link
+                      else '<p class="hint">Сейчас видео на сервере нет.</p>') + '</section>')
+    page = SHARE_PAGE.replace("<!--T-->", e(p.name)).replace("<!--B-->",
+        f'<section class="card"><h2>📁 {e(p.name)}</h2><p class="hint" style="margin:0">{" · ".join(e(m) for m in meta)}</p></section>{content}')
+    return HTMLResponse(page, headers=SHARE_HEADERS)
+
+
+async def share_file(request: Request):
+    x, p = share_folder(request.path_params["token"])
+    name = request.path_params["name"]
+    if not x:
+        raise HTTPException(404, "Ссылка недействительна")
+    f = next((v for v in local_videos(p) if v.name == name), None)  # только видео этой папки
+    if f is None:
+        raise HTTPException(404, "Файл не найден")
+    dl = request.query_params.get("dl") == "1"
+    return FileResponse(f, media_type=mimetypes.guess_type(f.name)[0] or "application/octet-stream",
+                        filename=f.name if dl else None, content_disposition_type="attachment" if dl else "inline",
+                        headers=SHARE_HEADERS)
+
+
+async def share_zip(request: Request):
+    x, p = share_folder(request.path_params["token"])
+    if not x:
+        raise HTTPException(404, "Ссылка недействительна")
+    files = sorted(local_videos(p), key=lambda f: f.name.lower())
+    if not files:
+        raise HTTPException(404, "В папке нет видео")
+    name = p.name + ".zip"
+    fallback = re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip() or "videos.zip"
+    return StreamingResponse(zip_stream(files), media_type="application/zip", headers=dict(SHARE_HEADERS, **{
+        "Content-Disposition": f"attachment; filename=\"{fallback}\"; filename*=UTF-8''{quote(name)}"}))
+
+
 async def backup_download(request: Request):
     pwd = str((await body(request)).get("password") or "")
     if len(pwd) < 8:
@@ -1820,6 +1987,7 @@ async def file_delete(request: Request):
         if folder_jobs(p.name):
             raise HTTPException(409, "С этой папкой есть задание в очереди или в работе — остановите его")
         shutil.rmtree(p)
+        shares_drop_folder(p.name)
     else:
         raise HTTPException(404, "Не найдено")
     return ok()
@@ -2146,6 +2314,7 @@ async def rename_folder(request: Request):
         if server_has:
             src.rename(dst)
             result["server"] = "переименована"
+            shares_rename(old, new)
             for j in jobs.values():  # в истории заданий — новое имя, чтобы «Запустить снова» шло в ту же папку
                 if j["folder"] == old and j["path"] == str(src):
                     j.update(folder=new, path=str(dst))
@@ -2191,7 +2360,7 @@ class AuthMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"] not in PUBLIC:
+        if scope["type"] == "http" and scope["path"] not in PUBLIC and not scope["path"].startswith("/s/"):
             if not is_authed(Request(scope)):
                 await JSONResponse({"detail": "Нужно войти в панель"}, status_code=403)(
                     scope, receive, send)
@@ -2257,6 +2426,12 @@ routes = [
     Route("/api/update/check", update_now, methods=["POST"]),
     Route("/api/backup", backup_download, methods=["POST"]),
     Route("/api/backup/restore", backup_restore, methods=["POST"]),
+    Route("/api/shares", shares_list),
+    Route("/api/shares", shares_create, methods=["POST"]),
+    Route("/api/shares/revoke", shares_revoke, methods=["POST"]),
+    Route("/s/{token}", share_page),
+    Route("/s/{token}/f/{name:path}", share_file),
+    Route("/s/{token}/zip", share_zip),
     Route("/api/restore", restore_start, methods=["POST"]),
     Route("/api/open_folder", open_folder, methods=["POST"]),
     Route("/api/files", files),
@@ -2439,6 +2614,40 @@ LOGIN_PAGE = r"""<!doctype html>
   <div class="err"><!--ERR--></div>
   <button class="primary" style="width:100%;margin-top:6px">Войти</button>
 </form></div></body></html>"""
+
+SHARE_PAGE = r"""<!doctype html>
+<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow"><meta name="referrer" content="no-referrer">
+<title><!--T--></title>""" + FAVICON_LINK + r"""<style>""" + STYLE + r"""
+#pl{width:100%;max-height:70vh;background:#000;border-radius:10px;display:block}
+.now{font-family:var(--mono);font-size:13px;margin:10px 0 12px;word-break:break-all;color:var(--muted)}
+.plist{display:grid;gap:4px}
+.pitem{display:flex;gap:10px;align-items:center;padding:8px 10px;border-radius:8px;cursor:pointer}
+.pitem:hover,.pitem.on{background:var(--sel)}
+.pitem .n{flex:1;min-width:0;word-break:break-all;font-size:14px}
+.pitem .muted{font-size:12px;white-space:nowrap}
+main{max-width:900px}
+</style></head><body>
+<header><div class="logo">▶</div><h1 style="font-size:16px"><!--T--></h1></header>
+<main><!--B--></main>
+<script>
+(function(){
+  var pl = document.getElementById('pl'), list = document.getElementById('plist'), now = document.getElementById('now');
+  if(!pl || !list) return;
+  function play(it){
+    [].forEach.call(list.querySelectorAll('.pitem'), function(x){ x.classList.toggle('on', x === it); });
+    pl.src = it.getAttribute('data-src'); now.textContent = it.getAttribute('data-name'); pl.play();
+    window.scrollTo({top: 0, behavior: 'smooth'});
+  }
+  list.addEventListener('click', function(e){
+    if(e.target.closest('a')) return;
+    var it = e.target.closest('.pitem'); if(it) play(it);
+  });
+  pl.addEventListener('ended', function(){
+    var cur = list.querySelector('.pitem.on'), nx = cur && cur.nextElementSibling; if(nx) play(nx);
+  });
+})();
+</script></body></html>"""
 
 PAGE = r"""<!doctype html>
 <html lang="ru">
@@ -2773,6 +2982,22 @@ PAGE = r"""<!doctype html>
     </div>
   </div>
 </div>
+<div class="modal hidden" id="shareModal" role="dialog" aria-modal="true" aria-labelledby="shareTitle">
+  <div class="modal-box">
+    <h2 id="shareTitle" style="margin:0 0 4px;font-size:16px">Ссылка для просмотра</h2>
+    <p class="hint" style="margin:0 0 10px">Страница с плеером и скачиванием видео этой папки — открывается без пароля панели.
+      Видна только эта папка. Ссылку можно отозвать в любой момент.</p>
+    <div class="row" style="align-items:end">
+      <div><label>Срок действия</label>
+        <select id="shareDays"><option value="1">1 день</option><option value="7" selected>7 дней</option><option value="30">30 дней</option><option value="0">Бессрочно</option></select></div>
+      <div class="fit"><button class="primary" id="shareCreate" type="button">Создать ссылку</button></div>
+    </div>
+    <div class="err" id="shareErr"></div>
+    <h3 style="font-size:14px;margin:16px 0 6px">Активные ссылки</h3>
+    <div id="shareList" class="muted" style="font-size:14px"></div>
+    <div style="margin-top:14px;text-align:right"><button type="button" id="shareClose">Закрыть</button></div>
+  </div>
+</div>
 <div class="toast hidden" id="toast" role="status"></div>
 
 <script>
@@ -2795,6 +3020,7 @@ const ICON = {
   copy: '<rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>',
   restore: '<path d="M7 18a5 5 0 1 1 .9-9.9A6 6 0 0 1 19 10a4 4 0 0 1 0 8"/><path d="M12 12v9"/><path d="m8.5 17.5 3.5 3.5 3.5-3.5"/>',
   stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
+  share: '<circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="m8.6 13.5 6.8 4"/><path d="m15.4 6.5-6.8 4"/>',
   edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
   send: '<path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/>',
   link: '<path d="M10 13a5 5 0 0 0 7.07 0l3-3a5 5 0 0 0-7.07-7.07l-1 1"/><path d="M14 11a5 5 0 0 0-7.07 0l-3 3a5 5 0 0 0 7.07 7.07l1-1"/>',
@@ -3057,6 +3283,7 @@ async function loadFiles(){
         ${g.archived && g.archived.link ? ibtn('copy', 'Скопировать ссылку на Диск', `data-copy="${esc(g.archived.link)}"`) : ''}
         ${g.archived && YA.connected ? ibtn('send', 'Отправить ссылку в чат', `data-send="${esc(g.name)}"`) : ''}
         ${g.name !== '(корень)' && g.files.length && YA.connected ? ibtn('cloud', 'Загрузить на Яндекс Диск' + autoSendNote(), `data-ya="${esc(g.name)}"`) : ''}
+        ${g.name !== '(корень)' ? ibtn('share', 'Ссылка для просмотра без пароля', `data-share="${esc(g.name)}"`) : ''}
         ${g.name !== '(корень)' ? ibtn('edit', 'Переименовать папку', `data-rename="${esc(g.name)}"`) : ''}
         ${g.name !== '(корень)' ? ibtn('trash', g.archived ? 'Убрать папку из списка' : 'Удалить папку', `data-del="${esc(g.name)}" data-what="${g.archived
           ? `папку «${esc(g.name)}» из списка (видео на Яндекс Диске останутся, но восстановить их кнопкой будет нельзя)` + (g.files.length ? ' вместе с видео на сервере' : '')
@@ -3326,6 +3553,31 @@ $('#jobsList').addEventListener('toggle', e => {
 }, true);
 $('#jobsClear').onclick = async () => { try{ await api('/api/jobs/clear', {}); pollJobs(); }catch(e){ toast(e.message); } };
 
+// ---------- ссылки для просмотра ----------
+let shareFolder = null;
+function openShare(folder){
+  shareFolder = folder; $('#shareTitle').textContent = 'Ссылка для просмотра: «' + folder + '»';
+  $('#shareErr').textContent = ''; show($('#shareModal')); loadShares();
+}
+async function loadShares(){
+  let d; try{ d = await api('/api/shares?folder=' + encodeURIComponent(shareFolder)); }catch(e){ $('#shareList').textContent = e.message; return; }
+  $('#shareList').innerHTML = d.shares.length ? d.shares.map(x => `<div class="linkrow" style="margin:0 0 10px">
+      <a class="l" href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.url)}</a>
+      ${ibtn('copy', 'Скопировать ссылку', `data-copy="${esc(x.url)}"`)} ${ibtn('trash', 'Отозвать ссылку', `data-revoke="${esc(x.token)}"`)}
+      <span class="muted" style="font-size:12px;width:100%">${x.expires ? 'действует до ' + new Date(x.expires * 1000).toLocaleString() : 'бессрочно'} · просмотров: ${x.views || 0}</span></div>`).join('')
+    : 'Пока нет — создайте ссылку выше.';
+}
+$('#shareCreate').onclick = async () => {
+  $('#shareErr').textContent = '';
+  try{
+    const x = await api('/api/shares', {folder: shareFolder, days: +$('#shareDays').value});
+    toast(await copyText(x.url) ? 'Ссылка создана и скопирована' : 'Ссылка создана');
+    loadShares();
+  }catch(e){ $('#shareErr').textContent = e.message; }
+};
+$('#shareClose').onclick = () => show($('#shareModal'), false);
+$('#shareModal').onclick = e => { if(e.target.id === 'shareModal') show($('#shareModal'), false); };
+
 // ---------- резервная копия ----------
 $('#bkBtn').onclick = async () => {
   $('#bkErr').textContent = '';
@@ -3493,6 +3745,12 @@ document.addEventListener('click', async e => {
     try{ await api('/api/jobs/stop', {id: js.dataset.jstop}); pollJobs(); }catch(err){ toast(err.message); } return; }
   const jr = e.target.closest('[data-jretry]');
   if(jr){ e.preventDefault(); try{ await api('/api/jobs/retry', {id: jr.dataset.jretry}); toast('Задание добавлено снова'); pollJobs(); }catch(err){ toast(err.message); } return; }
+  const sh = e.target.closest('[data-share]');
+  if(sh){ e.preventDefault(); openShare(sh.dataset.share); return; }
+  const sr = e.target.closest('[data-revoke]');
+  if(sr){ e.preventDefault();
+    if(!await askConfirm('Отозвать ссылку? Она сразу перестанет открываться.', 'Отозвать')) return;
+    try{ await api('/api/shares/revoke', {token: sr.dataset.revoke}); toast('Ссылка отозвана'); loadShares(); }catch(err){ toast(err.message); } return; }
   const rn = e.target.closest('[data-rename]');
   if(rn){ e.preventDefault(); openRename(rn.dataset.rename); return; }
   const s = e.target.closest('[data-send]');
