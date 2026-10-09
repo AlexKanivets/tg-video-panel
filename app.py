@@ -16,7 +16,7 @@ Telegram Video Panel — панель для пакетного скачиван
 
 # Версия панели (семантическая: исправления → 1.0.1, новые возможности → 1.1.0, несовместимые изменения → 2.0.0).
 # Меняется при каждом изменении кода; что изменилось — в CHANGELOG.md.
-VERSION = "1.3.1"
+VERSION = "1.4.0"
 
 import asyncio
 import hashlib
@@ -359,6 +359,7 @@ DEFAULT_SETTINGS = {
     "clean_age": False, "clean_age_days": 30,      # автоочистка: удалять видео старше N дней (только если есть на Диске)
     "clean_space": False, "clean_space_gb": 5,     # …или самые старые, пока свободного места меньше X ГБ
     "warn_space_gb": 3,                            # предупреждать, когда свободного места меньше Y ГБ
+    "update_check": True,                          # раз в 6 часов проверять новую версию на GitHub
     "dl_jobs": 2,                        # заданий на скачивание одновременно
     "tg_parallel": 3,                    # видео из Telegram одновременно (всего)
     "ya_parallel": 3,                    # файлов на/с Яндекс Диска одновременно (всего)
@@ -1186,6 +1187,55 @@ async def ya_get(j, h, remote, name, size, folder):
 # папка остаётся в списке «в архиве», видео восстанавливаются с Диска. Правила (в настройках):
 # старше N дней и/или самые старые, пока свободного места меньше X ГБ. Папки с заданиями не трогаем.
 
+# ---------- проверка обновлений ----------
+#
+# Раз в 6 часов анонимно спрашиваем GitHub о релизах; если есть версия новее VERSION — панель показывает
+# «Доступна X.Y.Z», что нового и команду обновления. Сама панель себя не обновляет (у неё нет прав root).
+
+UPDATE_REPO = os.environ.get("TVP_UPDATE_REPO", "AlexKanivets/tg-video-panel")
+update = {"checked": None, "latest": None, "newer": False, "releases": [], "error": None}
+
+
+def ver_tuple(v: str):
+    nums = re.findall(r"\d+", str(v or ""))[:3]
+    return tuple(int(x) for x in nums) + (0,) * (3 - len(nums))
+
+
+async def update_check() -> dict:
+    try:
+        async with httpx.AsyncClient(timeout=20, headers={"Accept": "application/vnd.github+json",
+                                                          "User-Agent": f"tg-video-panel/{VERSION}"}) as h:
+            r = await h.get(f"https://api.github.com/repos/{UPDATE_REPO}/releases", params={"per_page": 30})
+        if r.status_code != 200:
+            raise RuntimeError(f"GitHub ответил {r.status_code}")
+        rel = [x for x in r.json() if not x.get("draft") and not x.get("prerelease")]
+        rel.sort(key=lambda x: ver_tuple(x.get("tag_name")), reverse=True)
+        newer = [x for x in rel if ver_tuple(x.get("tag_name")) > ver_tuple(VERSION)]
+        update.update(checked=time.time(), error=None,
+                      latest=rel[0]["tag_name"].lstrip("v") if rel else None, newer=bool(newer),
+                      releases=[{"version": x["tag_name"].lstrip("v"), "name": x.get("name") or x["tag_name"],
+                                 "date": (x.get("published_at") or "")[:10], "notes": x.get("body") or "",
+                                 "url": x.get("html_url")} for x in newer])
+    except Exception as e:
+        update.update(checked=time.time(), error=str(e) or type(e).__name__)
+    return update
+
+
+async def update_loop():
+    await asyncio.sleep(20)
+    while True:
+        if get_settings().get("update_check", True):
+            await update_check()
+        await asyncio.sleep(6 * 3600)
+
+
+def update_public() -> dict:
+    mode = "docker" if os.environ.get("TVP_DOCKER") == "1" else "server" if SERVER else "local"
+    return dict(update, current=VERSION, mode=mode, repo=UPDATE_REPO,
+                enabled=bool(get_settings().get("update_check", True)))
+
+
+
 GIB = 1 << 30
 cleanup = {"running": False, "last": None, "reason": "", "deleted": 0, "freed": 0, "log": []}
 cleanup_lock = asyncio.Lock()
@@ -1490,6 +1540,15 @@ async def jobs_list(request: Request):
                "limits": {"dl_jobs": st["dl_jobs"], "tg_parallel": st["tg_parallel"], "ya_parallel": st["ya_parallel"]}})
 
 
+async def update_get(request: Request):
+    return ok(update_public())
+
+
+async def update_now(request: Request):
+    await update_check()
+    return ok(update_public())
+
+
 async def cleanup_get(request: Request):
     return ok(dict(cleanup, space=space_info()))
 
@@ -1681,6 +1740,8 @@ async def settings_set(request: Request):
                 raise HTTPException(400, "Параллельность — целое число")
     if "archive" in b:
         st["archive"] = bool(b["archive"])
+    if "update_check" in b:
+        st["update_check"] = bool(b["update_check"])
     for k in ("clean_age", "clean_space"):
         if k in b:
             st[k] = bool(b[k])
@@ -2040,12 +2101,14 @@ async def lifespan(_app):
     load_jobs()
     loop_task = asyncio.create_task(jobs_loop())
     clean_task = asyncio.create_task(cleanup_loop())
+    upd_task = asyncio.create_task(update_loop())
     wake_scheduler()
     yield
     jobs_state["shutdown"] = True  # незавершённые задания остаются «в работе» и продолжатся после запуска
     await cancel_all(list(job_tasks.values()))
     loop_task.cancel()
     clean_task.cancel()
+    upd_task.cancel()
     try:
         save_jobs()
     except Exception as e:
@@ -2073,6 +2136,8 @@ routes = [
     Route("/api/jobs/clear", jobs_clear, methods=["POST"]),
     Route("/api/cleanup", cleanup_get),
     Route("/api/cleanup/run", cleanup_now, methods=["POST"]),
+    Route("/api/update", update_get),
+    Route("/api/update/check", update_now, methods=["POST"]),
     Route("/api/restore", restore_start, methods=["POST"]),
     Route("/api/open_folder", open_folder, methods=["POST"]),
     Route("/api/files", files),
@@ -2115,6 +2180,13 @@ body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-a
 header{display:flex;align-items:center;gap:12px;padding:16px 20px;border-bottom:1px solid var(--line);background:var(--card);flex-wrap:wrap}
 header h1{font-size:18px;margin:0;font-weight:650}
 header .logo{width:30px;height:30px;border-radius:8px;background:var(--accent);display:grid;place-items:center;color:#fff}
+header .upd{font-size:12px;font-weight:600;color:#fff;background:#16a34a;border:0;border-radius:99px;padding:3px 10px;cursor:pointer}
+header .upd:hover{background:#15803d}
+.relnotes{max-height:45vh;overflow:auto;border:1px solid var(--line);border-radius:10px;padding:4px 14px;margin:10px 0;font-size:14px}
+.relnotes h4{margin:12px 0 4px;font-size:14px}
+.relnotes ul{margin:4px 0;padding-left:20px}
+.relnotes li{margin:2px 0}
+.cmd{font-family:var(--mono);font-size:12.5px;background:var(--input);border:1px solid var(--line);border-radius:8px;padding:10px 12px;white-space:pre-wrap;word-break:break-all}
 header .ver{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:99px;padding:1px 8px}
 header .me{margin-left:auto;color:var(--muted);font-size:14px;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 main{max-width:1100px;margin:0 auto;padding:20px 16px;display:grid;gap:18px}
@@ -2261,7 +2333,7 @@ PAGE = r"""<!doctype html>
 <body>
 <header>
   <div class="logo">▶</div>
-  <h1>Telegram Video Panel</h1><span class="ver" title="Версия панели">v""" + VERSION + r"""</span>
+  <h1>Telegram Video Panel</h1><span class="ver" title="Версия панели">v""" + VERSION + r"""</span><button class="upd hidden" id="updBadge" type="button"></button>
   <div class="me">
     <span id="meName"></span>
     <button class="link hidden" id="logoutBtn">Выйти из Telegram</button>
@@ -2414,6 +2486,12 @@ PAGE = r"""<!doctype html>
       <div><label>Файлов на Яндекс Диск одновременно (всего)</label><input type="number" id="stYa" min="1" max="8"></div>
     </div>
   </section>
+  <section class="card" id="updCard">
+    <h2>Обновления</h2>
+    <label class="check"><input type="checkbox" id="stUpdate"> Проверять новые версии на GitHub (раз в 6 часов)</label>
+    <div class="muted" style="font-size:13px;margin-top:4px">Панель только сообщает о новой версии и показывает команду обновления — сама себя она не обновляет.</div>
+    <div style="margin-top:10px"><button class="sm" id="updCheckNow" type="button">Проверить сейчас</button> <span class="muted" id="updState" style="font-size:13px"></span></div>
+  </section>
   <section class="card" id="cleanCard">
     <h2>Очистка сервера</h2>
     <p class="hint">Удаляются только видео, которые точно есть на Яндекс Диске (сверка имени и размера). Папка остаётся
@@ -2532,6 +2610,21 @@ PAGE = r"""<!doctype html>
     </div>
   </div>
 </div>
+<div class="modal hidden" id="updModal" role="dialog" aria-modal="true" aria-labelledby="updTitle">
+  <div class="modal-box">
+    <h2 id="updTitle" style="margin:0 0 4px;font-size:16px"></h2>
+    <p class="hint" id="updSub" style="margin:0"></p>
+    <div class="relnotes" id="updNotes"></div>
+    <div style="font-size:14px;margin:4px 0 6px">Как обновить — на сервере выполните:</div>
+    <div class="cmd" id="updCmd"></div>
+    <div class="muted" id="updNote" style="font-size:13px;margin-top:6px"></div>
+    <div style="margin-top:12px;display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap">
+      <a class="btn" id="updLink" target="_blank" rel="noopener">На GitHub</a>
+      <button type="button" id="updCopy">Скопировать команду</button>
+      <button type="button" class="primary" id="updClose">Закрыть</button>
+    </div>
+  </div>
+</div>
 <div class="toast hidden" id="toast" role="status"></div>
 
 <script>
@@ -2640,6 +2733,7 @@ async function init(){
     loadDialogs();
     loadSettings();
     pollJobs();
+    loadUpdate();
   }
 }
 
@@ -2876,6 +2970,7 @@ async function loadSettings(){
   $('#stCleanSpace').checked = !!ST.clean_space; $('#stCleanGb').value = ST.clean_space_gb; $('#stWarnGb').value = ST.warn_space_gb;
   $('#cleanHint').textContent = YA.connected ? '' : '⚠ Яндекс Диск не подключён — пока он не подключён, очистка ничего не удаляет.';
   loadCleanup();
+  $('#stUpdate').checked = ST.update_check !== false;
   $('#stAuto').checked = YA.connected && !!ST.auto_upload;
   $('#stAuto').disabled = !YA.connected;
   $('#stAutoHint').textContent = YA.connected ? '' : 'Доступно после подключения Яндекс Диска.';
@@ -2906,6 +3001,7 @@ $('#stSave').onclick = async () => {
   try{
     const r = await api('/api/settings', {ya_root: $('#stRoot').value, send_link: $('#stSend').checked,
       auto_upload: $('#stAuto').checked && YA.connected, archive: $('#stArchive').checked, info_file: $('#stInfo').checked,
+      update_check: $('#stUpdate').checked,
       clean_age: $('#stCleanAge').checked, clean_age_days: $('#stCleanDays').value,
       clean_space: $('#stCleanSpace').checked, clean_space_gb: $('#stCleanGb').value, warn_space_gb: $('#stWarnGb').value,
       dl_jobs: $('#stJobs').value, tg_parallel: $('#stTg').value, ya_parallel: $('#stYa').value,
@@ -3081,6 +3177,55 @@ $('#jobsList').addEventListener('toggle', e => {
   if(e.target.open){ if(!openLogs.has(id)){ openLogs.add(id); pollJobs(); } } else openLogs.delete(id);
 }, true);
 $('#jobsClear').onclick = async () => { try{ await api('/api/jobs/clear', {}); pollJobs(); }catch(e){ toast(e.message); } };
+
+// ---------- обновления ----------
+let UPD = null;
+function updCommand(mode){
+  if(mode === 'docker') return 'cd /opt/tg-video-panel && sudo git pull && sudo docker compose up -d --build';
+  if(mode === 'server') return 'cd /opt/tg-video-panel && sudo git pull && sudo bash install.sh --ip';
+  return 'git pull   # в папке панели, затем перезапустите её';
+}
+function notesHtml(md){  // простой показ описания релиза: заголовки ###, списки «- », абзацы
+  let html = '', inList = false;
+  const inline = t => esc(t).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '<code>$1</code>');
+  md.split('\n').forEach(line => {
+    const l = line.trimEnd();
+    if(/^\s*[-*] /.test(l)){ if(!inList){ html += '<ul>'; inList = true; } html += '<li>' + inline(l.replace(/^\s*[-*] /, '')) + '</li>'; return; }
+    if(/^\s{2,}\S/.test(l) && inList){ html = html.replace(/<\/li>$/, ' ' + inline(l.trim()) + '</li>'); return; }
+    if(inList){ html += '</ul>'; inList = false; }
+    if(/^#{1,6} /.test(l)) html += '<h4>' + inline(l.replace(/^#{1,6} /, '')) + '</h4>';
+    else if(l.trim()) html += '<p style="margin:6px 0">' + inline(l) + '</p>';
+  });
+  return html + (inList ? '</ul>' : '');
+}
+function renderUpdate(u){
+  UPD = u;
+  const b = $('#updBadge');
+  show(b, !!(u && u.newer && u.enabled));
+  if(u && u.newer) b.textContent = 'Доступна ' + u.latest;
+  $('#updState').textContent = !u ? '' : u.error ? 'Не удалось проверить: ' + u.error
+    : !u.checked ? 'Ещё не проверялось' : u.newer ? `Доступна версия ${u.latest} (у вас ${u.current})`
+    : `У вас последняя версия ${u.current} · проверено ${new Date(u.checked * 1000).toLocaleString()}`;
+}
+async function loadUpdate(){ try{ renderUpdate(await api('/api/update')); }catch(e){} setTimeout(loadUpdate, 30 * 60 * 1000); }
+$('#updBadge').onclick = () => {
+  const u = UPD; if(!u) return;
+  $('#updTitle').textContent = 'Доступна версия ' + u.latest;
+  $('#updSub').textContent = 'У вас ' + u.current + '. Что нового:';
+  $('#updNotes').innerHTML = u.releases.map(r => `<h4>${esc(r.name)}${r.date ? ' · ' + esc(r.date) : ''}</h4>${notesHtml(r.notes)}`).join('');
+  $('#updCmd').textContent = updCommand(u.mode);
+  $('#updNote').textContent = u.mode === 'docker' ? 'Панель перезапустится примерно на минуту; идущие задания продолжатся сами.'
+    : u.mode === 'server' ? 'Если ставили с доменом или без --ip — укажите тот же режим, что при установке. Идущие задания продолжатся сами.' : '';
+  $('#updLink').href = (u.releases[0] && u.releases[0].url) || ('https://github.com/' + u.repo + '/releases');
+  show($('#updModal'));
+};
+$('#updClose').onclick = () => show($('#updModal'), false);
+$('#updModal').onclick = e => { if(e.target.id === 'updModal') show($('#updModal'), false); };
+$('#updCopy').onclick = async () => toast(await copyText($('#updCmd').textContent) ? 'Команда скопирована' : 'Не удалось скопировать — выделите вручную');
+$('#updCheckNow').onclick = async () => {
+  $('#updState').textContent = 'Проверяю…';
+  try{ renderUpdate(await api('/api/update/check', {})); }catch(e){ $('#updState').textContent = e.message; }
+};
 
 // ---------- место на сервере и очистка ----------
 let SPACE = null;
